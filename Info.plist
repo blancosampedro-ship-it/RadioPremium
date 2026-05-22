@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.blancosampedro.RadioPremium.callback</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>radiopremium</string>
+			</array>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+		</dict>
+	</array>
+	<!-- ATS para AVPlayer: la mayoría de streams Radio Browser son HTTP. -->
+	<!-- NSAllowsArbitraryLoadsForMedia permite HTTP solo en AVFoundation; -->
+	<!-- el resto del app sigue HTTPS-only. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoadsForMedia</key>
+		<true/>
+	</dict>
+	<!-- Privacy string para MusicKit. Se muestra en el diálogo del sistema -->
+	<!-- la primera vez que se solicita autorización de Apple Music. -->
+	<key>NSAppleMusicUsageDescription</key>
+	<string>RadioPremium añade las canciones que identifica a tu playlist «Radio Likes» en Apple Music.</string>
+</dict>
+</plist>

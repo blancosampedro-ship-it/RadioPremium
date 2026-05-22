@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Sandbox desactivado a partir de 2026-04-28 (decisión coincidente con
+	premisa 1 del eng review). Bajo sideload notarizado no es necesario y
+	frameworks de audio (AVAudioConverter/AudioAnalytics) requieren XPC
+	exceptions que no aceptan en Mac App Store igualmente.
+
+	Si en el futuro se reactiva, las claves históricas eran:
+	  com.apple.security.app-sandbox = true
+	  com.apple.security.network.client = true
+	  com.apple.security.files.user-selected.read-only = true
+	más exceptions específicas para audio (mach-lookup audioanalyticsd, etc).
+
+	De momento dict vacío: el binario queda firmado solo con hardened runtime
+	(ENABLE_HARDENED_RUNTIME = YES sigue activo, eso es independiente).
+
+	Nota MusicKit: en macOS nativo NO existe el entitlement
+	com.apple.developer.musickit (sólo en iOS/iPadOS/Mac Catalyst). La
+	autorización funciona vía la registración del App Service "MusicKit"
+	en developer.apple.com sobre este Bundle ID + NSAppleMusicUsageDescription
+	en Info.plist. Si añades el entitlement aquí Xcode falla con
+	"Entitlement com.apple.developer.musickit not found and could not be
+	included in profile" porque el App ID en macOS no tiene ese derecho.
+	-->
+</dict>
+</plist>

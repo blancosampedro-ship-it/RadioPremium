@@ -1,0 +1,67 @@
+# =====================================================================
+# Radio Premium — macOS Swift / Xcode
+# .gitignore para repo PÚBLICO en GitHub
+# =====================================================================
+
+# === SECRETS — NUNCA SUBIR ===========================================
+# Plist con claves ACRCloud + Spotify Client ID + Redirect URI.
+# Cada quien usa su Secrets.example.plist como plantilla.
+**/Secrets.plist
+**/secrets.plist
+*.env
+.env
+.env.*
+
+# === macOS ===========================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# === Xcode build / derived data ======================================
+build/
+DerivedData/
+.build/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcuserstate
+*.xcuserstatec
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# === Swift Package Manager ===========================================
+.swiftpm/
+Package.resolved
+Packages/
+
+# === CocoaPods (por si acaso) ========================================
+Pods/
+
+# === IDE / herramientas ==============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Logs / temporales ===============================================
+*.log
+*.binlog
+stderr.txt
+stdout.txt
+
+# === Carpetas locales del proyecto ===================================
+# Backups defensivos creados durante sesiones de mantenimiento.
+_backups/
+
+# === Tests / coverage ================================================
+*.gcda
+*.gcno
+*.gcov
+coverage/
