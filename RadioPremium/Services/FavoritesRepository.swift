@@ -26,14 +26,24 @@ nonisolated struct FavoriteEntry: Codable, Sendable, Equatable {
 actor FavoritesRepository {
     private let store: JSONStore<[FavoriteEntry]>
 
-    /// Init estándar: persiste en Application Support/.../favorites.json.
+    /// Clave compartida con la app iOS hermana dentro de NSUbiquitousKeyValueStore.
+    private let kvKey = "RadioPremium.favorites.v1"
+    /// `nil` cuando los tests inyectan una URL custom — en ese caso no
+    /// sincronizamos con iCloud (las pruebas no necesitan red).
+    private let kvStore: NSUbiquitousKeyValueStore?
+
+    /// Init estándar: persiste en Application Support/.../favorites.json
+    /// y mantiene espejo en iCloud KV para sync con iPhone.
     init() throws {
         self.store = try JSONStore(filename: "favorites", defaultValue: [])
+        self.kvStore = NSUbiquitousKeyValueStore.default
     }
 
     /// Init para tests: pasa una URL custom (típicamente en tempDir).
+    /// No usa iCloud.
     init(url: URL) {
         self.store = JSONStore(url: url, defaultValue: [])
+        self.kvStore = nil
     }
 
     /// Devuelve los favoritos, más recientemente añadido primero.
@@ -58,6 +68,7 @@ actor FavoritesRepository {
         }
         all.append(FavoriteEntry(station: station, addedAt: Date()))
         try await store.save(all)
+        pushToIcloud(stations: all.map { $0.station })
         AppLogger.storage.info("favorite added '\(station.name, privacy: .public)' total=\(all.count, privacy: .public)")
         return true
     }
@@ -73,6 +84,7 @@ actor FavoritesRepository {
             return false
         }
         try await store.save(all)
+        pushToIcloud(stations: all.map { $0.station })
         AppLogger.storage.info("favorite removed id=\(stationId, privacy: .public) total=\(all.count, privacy: .public)")
         return true
     }
@@ -93,6 +105,64 @@ actor FavoritesRepository {
     /// Borra todos los favoritos. Idempotente.
     func clear() async {
         await store.reset()
+        pushToIcloud(stations: [])
         AppLogger.storage.info("favorites cleared")
+    }
+
+    // MARK: - iCloud sync
+
+    /// Lee de iCloud KV y aplica el resultado al store local.
+    /// Llamar en arranque y cuando llegue notificación didChangeExternally.
+    /// Estrategia: iCloud gana si tiene datos. Si iCloud está vacío y nosotros
+    /// tenemos favoritos locales, pusheamos para sembrar (típico primer arranque).
+    func syncWithIcloud() async {
+        guard let kv = kvStore else { return }
+        // El KV store puede no haber tirado de iCloud aún. `synchronize()` no
+        // es síncrono pero al menos solicita el pull.
+        kv.synchronize()
+
+        if let data = kv.data(forKey: kvKey),
+           let remoteStations = try? JSONDecoder().decode([Station].self, from: data) {
+            AppLogger.storage.info("iCloud has \(remoteStations.count, privacy: .public) favorites — merging")
+            await applyIcloudStations(remoteStations)
+        } else {
+            // iCloud vacío: pusheamos lo que tengamos local (primera vez).
+            let all = await store.load()
+            if !all.isEmpty {
+                AppLogger.storage.info("iCloud empty, seeding with \(all.count, privacy: .public) local favorites")
+                pushToIcloud(stations: all.map { $0.station })
+            }
+        }
+    }
+
+    /// Reemplaza el contenido local con el array de Stations recibido de iCloud.
+    /// Para Stations nuevas (que no estaban antes), asignamos `addedAt = Date()`.
+    /// Para Stations que se mantienen, conservamos su addedAt original.
+    private func applyIcloudStations(_ remote: [Station]) async {
+        let current = await store.load()
+        let now = Date()
+        var merged: [FavoriteEntry] = []
+        for station in remote {
+            if let existing = current.first(where: { $0.station.id == station.id }) {
+                merged.append(FavoriteEntry(station: station, addedAt: existing.addedAt))
+            } else {
+                merged.append(FavoriteEntry(station: station, addedAt: now))
+            }
+        }
+        try? await store.save(merged)
+    }
+
+    /// Pushea el array de Stations a iCloud KV (drop addedAt — iCloud solo guarda
+    /// el set de favoritos, no metadata local).
+    private func pushToIcloud(stations: [Station]) {
+        guard let kv = kvStore else { return }
+        do {
+            let data = try JSONEncoder().encode(stations)
+            kv.set(data, forKey: kvKey)
+            kv.synchronize()
+            AppLogger.storage.debug("pushed \(stations.count, privacy: .public) favorites to iCloud")
+        } catch {
+            AppLogger.storage.error("iCloud push failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }

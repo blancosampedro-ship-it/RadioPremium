@@ -16,14 +16,20 @@
 
 import Foundation
 import MediaPlayer
-import AppKit
 import os
+#if canImport(AppKit)
+import AppKit
+typealias PlatformImage = NSImage
+#elseif canImport(UIKit)
+import UIKit
+typealias PlatformImage = UIImage
+#endif
 
 @MainActor
 final class NowPlayingCenter {
 
     private weak var player: AudioPlayer?
-    private var artworkCache: [URL: NSImage] = [:]
+    private var artworkCache: [URL: PlatformImage] = [:]
 
     init(player: AudioPlayer) {
         self.player = player
@@ -59,7 +65,11 @@ final class NowPlayingCenter {
         }
 
         center.nowPlayingInfo = info
+        #if os(macOS)
+        // playbackState solo existe en macOS. En iOS, MPNowPlayingInfoCenter
+        // deriva el estado del rate del AVPlayer + AVAudioSession.
         center.playbackState = mapToMPState(state)
+        #endif
     }
 
     // MARK: - Remote commands
@@ -114,6 +124,7 @@ final class NowPlayingCenter {
 
     // MARK: - State mapping
 
+    #if os(macOS)
     private func mapToMPState(_ state: PlaybackState) -> MPNowPlayingPlaybackState {
         switch state {
         case .idle:                  return .stopped
@@ -122,13 +133,14 @@ final class NowPlayingCenter {
         case .error:                 return .interrupted
         }
     }
+    #endif
 
     // MARK: - Artwork loading
 
     private func loadAndCacheArtwork(from url: URL, for station: Station, currentState: PlaybackState) async {
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
-            guard let image = NSImage(data: data) else { return }
+            guard let image = PlatformImage(data: data) else { return }
             artworkCache[url] = image
             // Re-update si la emisora todavía es la activa
             update(station: station, state: currentState)
@@ -137,7 +149,7 @@ final class NowPlayingCenter {
         }
     }
 
-    private func makeArtwork(from image: NSImage) -> MPMediaItemArtwork {
+    private func makeArtwork(from image: PlatformImage) -> MPMediaItemArtwork {
         MPMediaItemArtwork(boundsSize: image.size) { _ in image }
     }
 }

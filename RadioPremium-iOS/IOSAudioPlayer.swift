@@ -1,0 +1,185 @@
+//
+//  IOSAudioPlayer.swift
+//  RadioPremium-iOS
+//
+//  Wrap de AVPlayer para streams de radio en iOS. Configura AVAudioSession
+//  con categoría `.playback` para que el audio siga sonando con el iPhone
+//  bloqueado y aparezca en Control Center.
+//
+//  Para que el audio continúe en background hay que añadir además la
+//  capability "Audio, AirPlay, and Picture in Picture" en el target
+//  (en Xcode: Signing & Capabilities → + → Background Modes → Audio).
+//
+
+import Foundation
+import AVFoundation
+import Observation
+import os
+
+enum IOSPlaybackState: Equatable, Sendable {
+    case idle
+    case buffering
+    case playing
+    case paused
+    case error(reason: String)
+
+    var isActive: Bool {
+        switch self {
+        case .buffering, .playing: return true
+        default:                   return false
+        }
+    }
+}
+
+@MainActor
+@Observable
+final class IOSAudioPlayer {
+
+    // MARK: - Observable state
+
+    private(set) var state: IOSPlaybackState = .idle
+    private(set) var currentStation: Station?
+
+    var volume: Float {
+        didSet {
+            let clamped = max(0, min(1, volume))
+            if clamped != volume { volume = clamped; return }
+            player.volume = clamped
+        }
+    }
+
+    // MARK: - Internals
+
+    private let player = AVPlayer()
+    private var rateObserver: NSKeyValueObservation?
+    private var statusObserver: NSKeyValueObservation?
+    private var bufferEmptyObserver: NSKeyValueObservation?
+    private var bufferLikelyObserver: NSKeyValueObservation?
+    private var failedObserver: NSObjectProtocol?
+    private let log = Logger(subsystem: "com.blancosampedro.RadioPremium-iOS", category: "audio")
+
+    init(initialVolume: Float = 0.8) {
+        self.volume = max(0, min(1, initialVolume))
+        player.volume = self.volume
+        player.automaticallyWaitsToMinimizeStalling = true
+        configureAudioSession()
+        observeRate()
+    }
+
+    // MARK: - Public API
+
+    func play(_ station: Station) {
+        log.info("play station=\(station.name, privacy: .public) url=\(station.url.absoluteString, privacy: .public)")
+        let item = AVPlayerItem(url: station.url)
+        observeItem(item)
+        player.replaceCurrentItem(with: item)
+        currentStation = station
+        state = .buffering
+        player.play()
+    }
+
+    func pause() {
+        log.info("pause")
+        player.pause()
+    }
+
+    func resume() {
+        guard player.currentItem != nil else { return }
+        log.info("resume")
+        player.play()
+    }
+
+    func stop() {
+        log.info("stop")
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        currentStation = nil
+        state = .idle
+    }
+
+    func togglePlayPause() {
+        switch state {
+        case .playing, .buffering: pause()
+        case .paused, .idle, .error: resume()
+        }
+    }
+
+    // MARK: - AudioSession setup
+
+    private func configureAudioSession() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true)
+            log.debug("AVAudioSession configured for .playback")
+        } catch {
+            log.error("AVAudioSession setup failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    // MARK: - KVO observers
+
+    private func observeRate() {
+        rateObserver = player.observe(\.rate, options: [.new]) { [weak self] _, change in
+            guard let self else { return }
+            Task { @MainActor in
+                let rate = change.newValue ?? 0
+                if rate > 0 {
+                    // Solo cambiar a .playing si veníamos de buffering/idle
+                    if self.state == .buffering || self.state == .idle {
+                        self.state = .playing
+                    }
+                } else {
+                    // rate == 0 puede ser .paused o .idle. Si tenemos item y
+                    // estado activo, asumimos paused.
+                    if self.state.isActive {
+                        self.state = .paused
+                    }
+                }
+            }
+        }
+    }
+
+    private func observeItem(_ item: AVPlayerItem) {
+        // Limpiar observers anteriores
+        statusObserver?.invalidate()
+        bufferEmptyObserver?.invalidate()
+        bufferLikelyObserver?.invalidate()
+        if let token = failedObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+
+        statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if item.status == .failed {
+                    let reason = item.error?.localizedDescription ?? "no se pudo cargar el stream"
+                    self.log.error("item failed: \(reason, privacy: .public)")
+                    self.state = .error(reason: reason)
+                }
+            }
+        }
+
+        bufferEmptyObserver = item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if item.isPlaybackBufferEmpty && self.state == .playing {
+                    self.state = .buffering
+                }
+            }
+        }
+
+        failedObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] note in
+            let reason = (note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription
+                ?? "playback finalizó por error"
+            Task { @MainActor in
+                self?.log.error("failed to play to end: \(reason, privacy: .public)")
+                self?.state = .error(reason: reason)
+            }
+        }
+    }
+}

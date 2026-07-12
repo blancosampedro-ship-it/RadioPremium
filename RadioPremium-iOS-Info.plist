@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	ATS para AVPlayer en iOS. La mayoría de streams de Radio Browser API
+	se sirven por HTTP plano (sin TLS). iOS bloquea HTTP por defecto.
+	NSAllowsArbitraryLoadsForMedia abre la excepción SOLO para APIs de
+	AVFoundation (AVPlayer, AVAsset). El resto de la app — incluidas las
+	llamadas a Radio Browser API vía URLSession — sigue obligado a HTTPS,
+	así que la superficie expuesta es mínima.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoadsForMedia</key>
+		<true/>
+	</dict>
+
+	<!--
+	Background mode "audio" — sin esto, iOS pausa el stream al bloquear
+	el iPhone o mandar la app a segundo plano. Lo declaramos aquí como
+	array literal porque INFOPLIST_KEY_UIBackgroundModes (build setting)
+	no se fusiona correctamente cuando convive con INFOPLIST_FILE.
+	-->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+</dict>
+</plist>

@@ -14,8 +14,13 @@
 
 import Foundation
 import AVFoundation
-import AppKit
 import os
+#if canImport(AppKit)
+import AppKit
+#endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 @Observable
@@ -51,7 +56,23 @@ final class AudioPlayer {
         player.volume = self.volume
         player.automaticallyWaitsToMinimizeStalling = true
         observeRate()
+        configureAudioSession()
         registerSleepHandler()
+    }
+
+    /// Configura `AVAudioSession` para reproducción de streams de radio en iOS.
+    /// `.playback` permite que el audio suene aunque el iPhone esté bloqueado
+    /// y aparece en Control Center. En macOS no hay AVAudioSession.
+    private func configureAudioSession() {
+        #if canImport(UIKit) && !os(watchOS)
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true, options: [])
+        } catch {
+            AppLogger.audio.error("AVAudioSession setup failed: \(error.localizedDescription, privacy: .public)")
+        }
+        #endif
     }
 
     // No custom deinit:
@@ -86,10 +107,32 @@ final class AudioPlayer {
     }
 
     /// Reanuda el stream pausado. Si no había nada cargado, no-op.
+    ///
+    /// Caso especial: si el item interno se quedó roto (state `.error`, item
+    /// status `.failed`, o `currentItem` nil tras un route change — p.ej.
+    /// desconexión de cascos), `player.play()` por sí solo NO recupera el
+    /// stream. En esos casos recreamos el AVPlayerItem desde `currentURL`,
+    /// que sí restaura el playback. Antes de este fix, la única forma de
+    /// recuperar tras una desconexión era cerrar y reabrir la app.
     func resume() {
-        guard currentURL != nil else { return }
+        guard let url = currentURL else { return }
         AppLogger.audio.info("resume")
-        if state == .paused {
+
+        // `.error` lleva associated value (reason: String), no se puede comparar
+        // con ==; usamos pattern matching `if case`.
+        let inErrorState: Bool
+        if case .error = state { inErrorState = true } else { inErrorState = false }
+
+        let itemNeedsRebuild = player.currentItem == nil
+            || player.currentItem?.status == .failed
+            || inErrorState
+        if itemNeedsRebuild {
+            AppLogger.audio.info("resume: item en mal estado → recreando AVPlayerItem")
+            play(url: url)
+            return
+        }
+
+        if state == .paused || inErrorState {
             state = .buffering
         }
         player.play()
@@ -195,7 +238,11 @@ final class AudioPlayer {
 
     // MARK: - Sleep handler (decisión 1F)
 
+    /// macOS: cuando el sistema va a dormir, pausa el stream. iOS no
+    /// necesita esto — `AVAudioSession` + background mode "audio" gestionan
+    /// las interrupciones (call, otra app, etc.) automáticamente.
     private func registerSleepHandler() {
+        #if canImport(AppKit)
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.willSleepNotification,
             object: nil,
@@ -209,5 +256,6 @@ final class AudioPlayer {
                 }
             }
         }
+        #endif
     }
 }
