@@ -19,9 +19,33 @@ private let sharedFavoritesRepo: FavoritesRepository? = {
     }
 }()
 
+/// Preferencias persistidas (volumen, país por defecto…). Compartidas a
+/// nivel de App. nil si Application Support no es accesible (raro).
+private let sharedSettingsStore: JSONStore<AppSettings>? = {
+    do {
+        return try JSONStore(filename: "settings", defaultValue: AppSettings.default)
+    } catch {
+        AppLogger.app.error("Settings store init failed: \(error.localizedDescription, privacy: .public). Preferencias no persistirán esta sesión.")
+        return nil
+    }
+}()
+
+/// Recientes / última emisora — fuente única de verdad (máx 10, solo local).
+private let sharedRecentsStore: RecentStationsStore? = {
+    do {
+        return try RecentStationsStore()
+    } catch {
+        AppLogger.app.error("RecentStationsStore init failed: \(error.localizedDescription, privacy: .public). Recientes deshabilitadas esta sesión.")
+        return nil
+    }
+}()
+
 @main
 struct RadioPremiumApp: App {
-    @State private var player = PlayerViewModel()
+    @State private var player = PlayerViewModel(
+        settings: sharedSettingsStore,
+        recents: sharedRecentsStore
+    )
     @State private var browse: RadioBrowseViewModel = RadioBrowseViewModel(
         client: RadioBrowserClient(),
         favoritesRepo: sharedFavoritesRepo

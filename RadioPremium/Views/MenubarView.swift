@@ -89,51 +89,65 @@ private struct NowPlayingBand: View {
     let station: Station
 
     var body: some View {
-        HStack(spacing: 10) {
-            StationArtwork(url: station.faviconURL, size: 48)
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                StationArtwork(url: station.faviconURL, size: 48)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(station.name)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                Text(stateLabel)
-                    .font(.caption)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(station.name)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text(stateLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    identify.startIdentify(currentStation: station)
+                } label: {
+                    Image(systemName: "music.note.list")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.tint)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut("i", modifiers: .command)
+                .accessibilityLabel("Identificar canción que está sonando")
+                .help("Identificar canción (⌘I)")
+
+                Button {
+                    player.togglePlayPause()
+                } label: {
+                    Image(systemName: player.isPlaying || player.isBuffering ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tint)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(player.isPlaying ? "Pausar" : "Reproducir")
+
+                Button {
+                    player.stop()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Parar y cerrar emisora")
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Slider(value: $player.volume, in: 0...1)
+                    .controlSize(.mini)
+                    .accessibilityLabel("Volumen")
+                Image(systemName: "speaker.wave.3.fill")
+                    .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
-
-            Spacer(minLength: 0)
-
-            Button {
-                identify.startIdentify(currentStation: station)
-            } label: {
-                Image(systemName: "music.note.list")
-                    .font(.system(size: 18))
-                    .foregroundStyle(.tint)
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut("i", modifiers: .command)
-            .accessibilityLabel("Identificar canción que está sonando")
-            .help("Identificar canción (⌘I)")
-
-            Button {
-                player.togglePlayPause()
-            } label: {
-                Image(systemName: player.isPlaying || player.isBuffering ? "pause.circle.fill" : "play.circle.fill")
-                    .font(.system(size: 28))
-                    .foregroundStyle(.tint)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(player.isPlaying ? "Pausar" : "Reproducir")
-
-            Button {
-                player.stop()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 22))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Parar y cerrar emisora")
         }
     }
 

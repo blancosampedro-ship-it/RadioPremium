@@ -21,6 +21,9 @@ import AppKit
 #if canImport(UIKit)
 import UIKit
 #endif
+#if os(macOS)
+import CoreAudio
+#endif
 
 @MainActor
 @Observable
@@ -30,6 +33,22 @@ final class AudioPlayer {
 
     private(set) var state: PlaybackState = .idle
     private(set) var currentURL: URL?
+
+    /// Identificador de la sesión de reproducción actual. Se regenera en cada
+    /// `play()` (acción de usuario / cambio de emisora) y en `stop()`.
+    /// Los consumidores (p.ej. RecentStationsStore) lo usan para deduplicar
+    /// eventos dentro de una misma reproducción: rebufferings y transiciones
+    /// de estado de la misma sesión comparten ID. Fase 2 añadirá reintentos
+    /// internos que CONSERVAN este ID (vía startPlayback) y pause(reason:).
+    private(set) var playbackSessionID = UUID()
+
+    /// `true` solo cuando la última pausa vino de una acción DELIBERADA del
+    /// usuario (botón pausa de la UI). Las pausas por causas externas
+    /// (detección de oído de los AirPods vía comando de media, sleep del
+    /// sistema) lo dejan en `false`. Gobierna el auto-resume por cambio de
+    /// ruta de audio: si tú pausaste a propósito, un cambio de dispositivo
+    /// NO reanuda.
+    private var lastPauseWasUserInitiated = false
 
     var volume: Float {
         didSet {
@@ -48,6 +67,11 @@ final class AudioPlayer {
     private var bufferLikelyObserver: NSKeyValueObservation?
     private var failedToPlayToEndObserver: NSObjectProtocol?
     private var sleepObserver: NSObjectProtocol?
+    #if os(macOS)
+    /// Bloque del listener de Core Audio para el cambio de dispositivo de
+    /// salida por defecto. Se guarda para poder retirarlo si hiciera falta.
+    private var outputDeviceListenerBlock: AudioObjectPropertyListenerBlock?
+    #endif
 
     // MARK: - Init / deinit
 
@@ -58,6 +82,7 @@ final class AudioPlayer {
         observeRate()
         configureAudioSession()
         registerSleepHandler()
+        registerOutputDeviceListener()
     }
 
     /// Configura `AVAudioSession` para reproducción de streams de radio en iOS.
@@ -85,8 +110,18 @@ final class AudioPlayer {
 
     /// Carga un stream nuevo y empieza a reproducir.
     /// Si ya había algo sonando, lo reemplaza limpiamente.
+    /// Acción de usuario: regenera la sesión de reproducción.
     func play(url: URL) {
         AppLogger.audio.info("play url=\(url.absoluteString, privacy: .public)")
+        playbackSessionID = UUID()
+        lastPauseWasUserInitiated = false
+        loadAndPlay(url: url)
+    }
+
+    /// Carga el item y arranca SIN regenerar la sesión. Uso interno para
+    /// reanudaciones automáticas (p.ej. auto-resume por cambio de ruta de
+    /// audio) que deben preservar la sesión para no ensuciar "recientes".
+    private func loadAndPlay(url: URL) {
         let item = AVPlayerItem(url: url)
         observeItem(item)
         player.replaceCurrentItem(with: item)
@@ -96,8 +131,13 @@ final class AudioPlayer {
     }
 
     /// Pausa el stream actual sin descargarlo.
-    func pause() {
-        AppLogger.audio.info("pause")
+    /// - Parameter userInitiated: `true` cuando lo dispara el usuario a
+    ///   propósito (botón pausa). En ese caso, un cambio de ruta de audio
+    ///   posterior NO reanudará automáticamente. Las pausas externas
+    ///   (detección de oído, sleep) pasan `false`.
+    func pause(userInitiated: Bool = false) {
+        AppLogger.audio.info("pause (userInitiated: \(userInitiated, privacy: .public))")
+        lastPauseWasUserInitiated = userInitiated
         player.pause()
         // El observer de rate también detectará esto; ponemos paused
         // explícitamente para que el cambio de UI sea instantáneo.
@@ -139,8 +179,11 @@ final class AudioPlayer {
     }
 
     /// Para por completo, libera el item, vuelve a idle.
+    /// Invalida la sesión de reproducción: nada pendiente de una sesión
+    /// anterior (reintentos, reanudaciones) debe sobrevivir a un stop.
     func stop() {
         AppLogger.audio.info("stop")
+        playbackSessionID = UUID()
         player.pause()
         player.replaceCurrentItem(with: nil)
         currentURL = nil
@@ -258,4 +301,94 @@ final class AudioPlayer {
         }
         #endif
     }
+
+    // MARK: - Auto-resume por cambio de ruta de audio (macOS)
+
+    #if os(macOS)
+    /// Registra un listener de Core Audio sobre el dispositivo de salida por
+    /// defecto. Cuando la salida vuelve a un dispositivo EXTERNO (cascos,
+    /// AirPods, etc.) tras una pausa no deliberada, reanuda solo.
+    ///
+    /// Limitación conocida: quitar/poner UN solo AirPod NO cambia el
+    /// dispositivo de salida (la ruta sigue en los AirPods), así que ese
+    /// gesto concreto no dispara este listener — macOS no expone ninguna
+    /// señal pública para él. Sí cubre: quitar los dos AirPods (la salida
+    /// cae a los altavoces y vuelve), desconexión/reconexión Bluetooth, y
+    /// cambio manual de dispositivo de salida.
+    private func registerOutputDeviceListener() {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            // El listener se invoca en la cola main que pasamos abajo, pero
+            // Swift Concurrency no lo sabe: saltamos explícitamente al actor.
+            Task { @MainActor in self?.handleOutputDeviceChanged() }
+        }
+        outputDeviceListenerBlock = block
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr,
+            DispatchQueue.main,
+            block
+        )
+        // No lo retiramos en deinit: AudioPlayer vive lo que vive la app
+        // (instancia única); la terminación del proceso lo limpia.
+    }
+
+    private func handleOutputDeviceChanged() {
+        guard let url = currentURL else { return }           // nada cargado / stop
+        guard !lastPauseWasUserInitiated else {              // pausa deliberada → respetar
+            AppLogger.audio.info("route change: pausa fue del usuario, no auto-resume")
+            return
+        }
+        // Solo reanudamos si estamos pausados o en error (no si ya suena).
+        let eligibleState: Bool
+        switch state {
+        case .paused, .error: eligibleState = true
+        case .idle, .playing, .buffering: eligibleState = false
+        }
+        guard eligibleState else { return }
+
+        // Solo si la nueva salida es un dispositivo EXTERNO. Volver a los
+        // altavoces internos NO debe soltar audio de golpe (guía de Apple).
+        let newDevice = Self.defaultOutputDevice()
+        guard !Self.isBuiltInSpeakers(newDevice) else {
+            AppLogger.audio.info("route change → altavoces internos, no auto-resume")
+            return
+        }
+
+        AppLogger.audio.info("route change → dispositivo externo, auto-resume (rebuild, sesión preservada)")
+        loadAndPlay(url: url)   // preserva playbackSessionID
+    }
+
+    private static func defaultOutputDevice() -> AudioDeviceID {
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return id
+    }
+
+    private static func isBuiltInSpeakers(_ id: AudioDeviceID) -> Bool {
+        guard id != 0 else { return false }
+        var transport = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &transport)
+        guard status == noErr else { return false }
+        return transport == kAudioDeviceTransportTypeBuiltIn
+    }
+    #else
+    private func registerOutputDeviceListener() {}
+    #endif
 }
