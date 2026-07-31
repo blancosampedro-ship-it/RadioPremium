@@ -32,9 +32,12 @@ struct FavoritesView: View {
                     StationRowView(station: station)
                 }
                 .onDelete { indexSet in
-                    for idx in indexSet {
-                        let s = model.favorites.stations[idx]
-                        model.favorites.remove(s)
+                    // Resolver las víctimas ANTES de borrar: iterar el IndexSet
+                    // mutando el array invalida los índices siguientes en un
+                    // borrado múltiple (podía borrar la emisora equivocada).
+                    let victims = indexSet.map { model.favorites.stations[$0] }
+                    for station in victims {
+                        model.favorites.remove(station)
                     }
                 }
             }

@@ -26,6 +26,8 @@ final class AppModel {
     private(set) var isSearching = false
     private(set) var errorMessage: String?
 
+    private var nowPlayingTask: Task<Void, Never>?
+
     private let log = Logger(subsystem: "com.blancosampedro.RadioPremium-iOS", category: "app")
 
     init() {
@@ -34,6 +36,30 @@ final class AppModel {
         self.favorites = FavoritesStore()
         self.api = RadioBrowserAPI()
         self.nowPlaying = NowPlayingHelper(player: player)
+        observePlayerForNowPlaying()
+    }
+
+    /// Re-publica el Now Playing cada vez que cambian el estado o la emisora
+    /// del player, indefinidamente. Sustituye al sondeo de 20×500ms que se
+    /// detenía a los 10 segundos: pasado ese tiempo (o al pausar desde el
+    /// propio Control Center, cuyos comandos no re-publicaban), la pantalla de
+    /// bloqueo mostraba un playbackRate que ya no era real. Mismo patrón
+    /// withObservationTracking que usa el PlayerViewModel de macOS.
+    private func observePlayerForNowPlaying() {
+        nowPlayingTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.nowPlaying.update(station: self.player.currentStation, state: self.player.state)
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    withObservationTracking {
+                        _ = self.player.state
+                        _ = self.player.currentStation
+                    } onChange: {
+                        continuation.resume()
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Browse
@@ -78,20 +104,9 @@ final class AppModel {
 
     func play(_ station: Station) {
         player.play(station)
-        // Update Now Playing inmediato + cuando cambie el estado por KVO
-        // re-publicamos vía observer side effect.
+        // Update inmediato; los cambios posteriores de estado los re-publica
+        // el bucle observePlayerForNowPlaying.
         nowPlaying.update(station: station, state: player.state)
-        // Observador ad-hoc del cambio de estado:
-        Task { @MainActor in
-            // Pequeño bucle: cuando cambie el state, refrescar.
-            // Con @Observable + el hecho de que las views observan al player
-            // directamente, esto solo refresca la metadata del Control Center.
-            for _ in 0..<20 {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                nowPlaying.update(station: station, state: player.state)
-                if case .error = player.state { break }
-            }
-        }
     }
 
     func togglePlayPause() {

@@ -69,11 +69,11 @@ final class FavoritesStore {
 
     private func loadLocal() {
         guard let data = defaults.data(forKey: localKey) else { return }
-        do {
-            stations = try JSONDecoder().decode([Station].self, from: data)
+        if let decoded = Self.decodeStationsTolerant(data) {
+            stations = decoded
             log.info("loaded \(self.stations.count) favorites from local mirror")
-        } catch {
-            log.error("local favorites decode failed: \(error.localizedDescription, privacy: .public)")
+        } else {
+            log.error("local favorites decode failed (payload ilegible)")
             stations = []
         }
     }
@@ -117,14 +117,55 @@ final class FavoritesStore {
             }
             return
         }
-        do {
-            let remote = try JSONDecoder().decode([Station].self, from: data)
+        if let remote = Self.decodeStationsTolerant(data) {
             log.info("iCloud tiene \(remote.count) favoritos, mergeando")
             stations = remote
             persistLocal()
-        } catch {
-            log.error("iCloud favorites decode failed: \(error.localizedDescription, privacy: .public)")
+        } else {
+            log.error("iCloud favorites decode failed (payload ilegible) — conservando lo local")
         }
+    }
+
+    /// Decodifica el array de Stations descartando las entradas que no
+    /// decodifican, en vez de invalidar el array completo.
+    ///
+    /// Crítico para el interop con macOS: la Station de macOS codifica
+    /// `url_resolved` con encodeIfPresent (puede faltar), y la de iOS lo exige.
+    /// Con el decode estricto, UN solo favorito sin stream URL guardado desde
+    /// el Mac rompía TODOS los favoritos del iPhone en silencio, y el sync
+    /// quedaba muerto mientras esa entrada existiera. Mismo patrón PartialList
+    /// que ya usa RadioBrowserAPI.
+    /// Devuelve nil solo si el payload ni siquiera es un array JSON.
+    private static func decodeStationsTolerant(_ data: Data) -> [Station]? {
+        struct PartialList: Decodable {
+            let stations: [Station]
+            let skipped: Int
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var result: [Station] = []
+                var failures = 0
+                while !container.isAtEnd {
+                    if let station = try? container.decode(Station.self) {
+                        result.append(station)
+                    } else {
+                        _ = try? container.decode(EmptyDecodable.self)
+                        failures += 1
+                    }
+                }
+                self.stations = result
+                self.skipped = failures
+            }
+        }
+        struct EmptyDecodable: Decodable {}
+
+        guard let list = try? JSONDecoder().decode(PartialList.self, from: data) else {
+            return nil
+        }
+        if list.skipped > 0 {
+            Logger(subsystem: "com.blancosampedro.RadioPremium-iOS", category: "favorites")
+                .warning("favoritos: \(list.skipped) entradas ilegibles descartadas (¿guardadas por otra versión?)")
+        }
+        return list.stations
     }
 
     private func observeIcloudChanges() {
@@ -132,8 +173,15 @@ final class FavoritesStore {
             forName: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
             object: kv,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
+            // Una violación de cuota (1 MB de iCloud KV) también llega por esta
+            // notificación; sin mirar el reason se confundía con un cambio
+            // remoto normal y el push rechazado pasaba desapercibido.
+            let reason = note.userInfo?[NSUbiquitousKeyValueStoreChangeReasonKey] as? Int
             Task { @MainActor in
+                if reason == NSUbiquitousKeyValueStoreQuotaViolationChange {
+                    self?.log.error("iCloud KV: cuota superada — el push de favoritos fue rechazado")
+                }
                 self?.log.info("iCloud changed externally → re-mergeando")
                 self?.mergeIcloud(initial: false)
             }

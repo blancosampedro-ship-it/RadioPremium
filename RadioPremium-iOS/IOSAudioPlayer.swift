@@ -84,7 +84,21 @@ final class IOSAudioPlayer {
     }
 
     func resume() {
-        guard player.currentItem != nil else { return }
+        // Port del fix de macOS (AudioPlayer.resume): tras un corte del stream,
+        // player.play() sobre un item roto NO recupera nada — hay que
+        // reconstruir el AVPlayerItem. Sin esto, el botón de play quedaba
+        // muerto tras cada desconexión hasta re-seleccionar la emisora.
+        let itemBroken = player.currentItem == nil || player.currentItem?.status == .failed
+        let inErrorState: Bool = {
+            if case .error = state { return true }
+            return false
+        }()
+        if itemBroken || inErrorState {
+            guard let station = currentStation else { return }
+            log.info("resume: item roto o estado error — reconstruyendo AVPlayerItem")
+            play(station)
+            return
+        }
         log.info("resume")
         player.play()
     }

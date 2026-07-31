@@ -118,7 +118,7 @@ struct StationRowView: View {
             .buttonStyle(.plain)
 
             Button {
-                model.play(station)
+                activate()
             } label: {
                 Image(systemName: isCurrentlyPlaying ? "pause.circle.fill" : "play.circle.fill")
                     .font(.title2)
@@ -128,7 +128,19 @@ struct StationRowView: View {
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
-        .onTapGesture { model.play(station) }
+        .onTapGesture { activate() }
+    }
+
+    /// Si la fila es la emisora actual, alterna play/pausa; si no, reproduce.
+    /// Antes la acción era siempre `play(station)`: el botón mostraba el icono
+    /// de pausa pero pulsar recreaba el AVPlayerItem y rebufferizaba desde
+    /// cero — era imposible pausar desde la lista.
+    private func activate() {
+        if model.player.currentStation?.id == station.id {
+            model.togglePlayPause()
+        } else {
+            model.play(station)
+        }
     }
 
     private var isCurrentlyPlaying: Bool {
