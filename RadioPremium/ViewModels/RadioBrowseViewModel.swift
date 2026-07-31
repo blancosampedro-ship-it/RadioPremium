@@ -132,11 +132,18 @@ final class RadioBrowseViewModel {
     }
 
     /// Cancela cualquier búsqueda en curso (al cerrar popover, etc).
+    ///
+    /// Restablece `isLoading` aquí y no en los catch de cancelación: cuando la
+    /// Task muere por REEMPLAZO (nueva búsqueda), la nueva ya gestiona el flag,
+    /// y que la vieja lo apagase después dejaría la carga real sin spinner.
+    /// Sin este reset, cerrar el popover a mitad de búsqueda dejaba
+    /// isLoading=true para siempre (la vista solo relanza si results está vacío).
     func cancel() {
         searchTask?.cancel()
         searchTask = nil
         favoritesTask?.cancel()
         favoritesTask = nil
+        isLoading = false
     }
 
     // MARK: - Favoritos
@@ -177,15 +184,15 @@ final class RadioBrowseViewModel {
             do {
                 _ = try await repo.toggle(station)
             } catch {
-                // Revert en caso de fallo de I/O.
+                // Revert en caso de fallo de I/O: recargamos el estado REAL del
+                // repo en vez de reconstruirlo a mano — dos toggles rápidos de la
+                // misma emisora podían revertir sobre un array ya cambiado y
+                // duplicar la entrada.
                 AppLogger.storage.error(
-                    "toggle favorite failed for '\(station.name, privacy: .public)': \(error.localizedDescription, privacy: .public). Revirtiendo."
+                    "toggle favorite failed for '\(station.name, privacy: .public)': \(error.localizedDescription, privacy: .public). Recargando del repo."
                 )
-                if wasFavorite {
-                    self.favorites.insert(station, at: 0)
-                } else {
-                    self.favorites.removeAll { $0.id == station.id }
-                }
+                let entries = await repo.load()
+                self.favorites = entries.map(\.station)
             }
         }
     }

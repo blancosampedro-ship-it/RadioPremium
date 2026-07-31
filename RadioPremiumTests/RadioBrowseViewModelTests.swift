@@ -129,6 +129,26 @@ final class RadioBrowseViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isLoading)
     }
 
+    func testCancel_resetsIsLoading() async {
+        // Regresión del "spinner infinito": cerrar el popover a mitad de una
+        // búsqueda cancelaba la Task sin apagar isLoading, y al reabrir la
+        // vista no relanzaba la carga si results no estaba vacío.
+        MockURLProtocol.setHandler { request in
+            Thread.sleep(forTimeInterval: 0.2)
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, "[]".data(using: .utf8))
+        }
+
+        vm.query = "jazz"
+        vm.performSearch()
+        await waitFor(vm.isLoading)
+        XCTAssertTrue(vm.isLoading, "Precondición: la búsqueda debe estar en vuelo")
+
+        vm.cancel()
+
+        XCTAssertFalse(vm.isLoading, "cancel() debe apagar el spinner")
+    }
+
     // MARK: - performSearch
 
     func testPerformSearch_withQuery_callsSearchEndpoint() async {
