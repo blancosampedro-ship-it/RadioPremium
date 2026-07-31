@@ -21,6 +21,7 @@
 //
 
 import Foundation
+import MusicKit
 import Observation
 import os
 
@@ -83,9 +84,11 @@ final class AppleMusicViewModel {
     private func runFlow(for track: Track) async {
         // En Apple Music la auth está integrada en el flujo: el primer
         // `addTrackToRadioLikes` que el cliente ve dispara el diálogo del
-        // sistema vía `MusicAuthorization.request()`. Lo reflejamos en UI
-        // mostrando primero `.authenticating` y luego `.processing`.
-        state = .authenticating
+        // sistema vía `MusicAuthorization.request()`. Si ya estamos autorizados
+        // (el caso habitual tras el primer uso) no hay diálogo que esperar, así
+        // que mostramos directamente `.processing` — antes `.processing` era
+        // inalcanzable y el botón decía "Autorizando…" durante toda la operación.
+        state = MusicAuthorization.currentStatus == .authorized ? .processing : .authenticating
         do {
             let outcome = try await api.addTrackToRadioLikes(track)
             if Task.isCancelled { return }
@@ -105,7 +108,10 @@ final class AppleMusicViewModel {
             if Task.isCancelled { return }
             state = .error(reason: "Necesitas una suscripción activa de Apple Music para añadir canciones.")
         } catch is CancellationError {
-            state = .idle
+            // No tocar state: si la cancelación vino de un reemplazo (nuevo
+            // addToPlaylist), la Task nueva ya gestiona el estado y poner .idle
+            // aquí lo pisaría. reset() ya pone .idle por su cuenta.
+            return
         } catch {
             if Task.isCancelled { return }
             let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

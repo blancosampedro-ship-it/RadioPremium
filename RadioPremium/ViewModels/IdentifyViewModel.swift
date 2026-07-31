@@ -111,6 +111,10 @@ final class IdentifyViewModel {
     func startIdentify(currentStation: Station?) {
         cancelInFlight()
         lastStation = currentStation
+        // Reset ANTES de presentar: sin esto, reabrir el sheet (o "Reintentar")
+        // mostraba la tarjeta vieja de error/"sin resultados" hasta que la sonda
+        // de permisos terminaba, y el botón parecía no responder.
+        state = .idle
         isPresented = true
 
         currentTask = Task { @MainActor [weak self] in

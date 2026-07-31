@@ -68,6 +68,11 @@ struct RadioPremiumApp: App {
     @State private var spotify = SpotifyViewModel()
     @State private var appleMusic = AppleMusicViewModel()
 
+    /// Token del observer de iCloud. El `.task` del MenuBarExtra se re-dispara
+    /// en CADA apertura del popover; sin este guard se acumulaba un observer
+    /// por apertura y cada cambio de iCloud disparaba N re-merges concurrentes.
+    @State private var icloudObserverToken: NSObjectProtocol?
+
     var body: some Scene {
         MenuBarExtra("Radio Premium", systemImage: "dot.radiowaves.left.and.right") {
             MenubarView(
@@ -93,12 +98,21 @@ struct RadioPremiumApp: App {
         browse.loadFavorites()
 
         // Listener para cambios externos vía iCloud (otra device).
-        NotificationCenter.default.addObserver(
+        // Registrado UNA sola vez aunque el .task se re-ejecute por apertura.
+        guard icloudObserverToken == nil else { return }
+        icloudObserverToken = NotificationCenter.default.addObserver(
             forName: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
             object: NSUbiquitousKeyValueStore.default,
             queue: .main
-        ) { _ in
-            Task {
+        ) { note in
+            // El sistema también notifica cuando RECHAZA nuestro push por cuota
+            // (1 MB por app en iCloud KV). Sin mirar el reason, ese rechazo se
+            // confundía con un cambio remoto normal y el sync moría en silencio.
+            let reason = note.userInfo?[NSUbiquitousKeyValueStoreChangeReasonKey] as? Int
+            if reason == NSUbiquitousKeyValueStoreQuotaViolationChange {
+                AppLogger.app.error("iCloud KV: cuota superada — el push de favoritos fue rechazado")
+            }
+            Task { @MainActor in
                 AppLogger.app.info("iCloud favorites changed externally → re-mergeando")
                 await repo.syncWithIcloud()
                 browse.loadFavorites()
