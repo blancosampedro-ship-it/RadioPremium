@@ -51,9 +51,10 @@ final class JSONStoreTests: XCTestCase {
         XCTAssertEqual(loaded, saved)
     }
 
-    func testLoad_returnsDefault_andDeletesFile_whenJSONCorrupted() async throws {
+    func testLoad_returnsDefault_andQuarantinesFile_whenJSONCorrupted() async throws {
         let url = tempURL()
-        try "this is not json {{ broken".data(using: .utf8)!.write(to: url)
+        let corruptContent = "this is not json {{ broken"
+        try corruptContent.data(using: .utf8)!.write(to: url)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
 
         let store = JSONStore<TestModel>(url: url, defaultValue: Self.defaultModel)
@@ -62,8 +63,32 @@ final class JSONStoreTests: XCTestCase {
         XCTAssertEqual(loaded, Self.defaultModel)
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: url.path),
-            "Archivo corrupto debe borrarse tras recovery."
+            "El archivo original debe apartarse tras recovery."
         )
+        // El contenido NO se destruye: queda en cuarentena .corrupt para
+        // recuperación manual (un decode fallido puede ser un esquema futuro,
+        // no basura — borrarlo significaba perder datos del usuario).
+        let quarantined = url.appendingPathExtension("corrupt")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: quarantined.path),
+            "El archivo corrupto debe conservarse como .corrupt."
+        )
+        let preserved = try String(contentsOf: quarantined, encoding: .utf8)
+        XCTAssertEqual(preserved, corruptContent, "La cuarentena debe conservar el contenido original.")
+    }
+
+    func testLoad_replacesPreviousQuarantine_onSecondCorruption() async throws {
+        let url = tempURL()
+        let quarantined = url.appendingPathExtension("corrupt")
+        let store = JSONStore<TestModel>(url: url, defaultValue: Self.defaultModel)
+
+        try "primera corrupción {{".data(using: .utf8)!.write(to: url)
+        _ = await store.load()
+        try "segunda corrupción {{".data(using: .utf8)!.write(to: url)
+        _ = await store.load()
+
+        let preserved = try String(contentsOf: quarantined, encoding: .utf8)
+        XCTAssertEqual(preserved, "segunda corrupción {{", "La cuarentena debe quedarse con la más reciente.")
     }
 
     // MARK: - Save

@@ -5,8 +5,11 @@
 //  Almacén genérico de objetos Codable en disco vía JSON.
 //  Ubicación estándar: ~/Library/Application Support/com.blancosampedro.RadioPremium/{filename}.json
 //
-//  Recovery graceful: si el JSON está corrupto, log warning + borra el archivo
-//  + devuelve el defaultValue. Evita que un único archivo dañado tumbe la app.
+//  Recovery graceful: si el JSON está corrupto, log warning + se aparta el
+//  archivo a `<nombre>.json.corrupt` + devuelve el defaultValue. Evita que un
+//  único archivo dañado tumbe la app, sin destruir los datos: un decode fallido
+//  también ocurre si un esquema futuro añade un campo obligatorio, y borrar
+//  significaba perder favoritos/historial sin posibilidad de recuperación.
 //
 //  Atomic writes: save() usa Data.write con `.atomic` para evitar archivos
 //  truncados si el sistema corta la operación a la mitad.
@@ -56,20 +59,45 @@ actor JSONStore<T: Codable & Sendable> {
     }
 
     /// Carga desde disco. Devuelve `defaultValue` si el archivo no existe o si
-    /// el JSON está corrupto (en cuyo caso también borra el archivo dañado).
+    /// el JSON no decodifica (en cuyo caso el archivo se aparta a `.corrupt`,
+    /// nunca se borra). Un fallo de LECTURA (I/O transitorio) no toca el archivo:
+    /// la próxima carga reintentará.
     func load() async -> T {
         guard FileManager.default.fileExists(atPath: url.path) else {
             return defaultValue
         }
+        let data: Data
         do {
-            let data = try Data(contentsOf: url)
+            data = try Data(contentsOf: url)
+        } catch {
+            AppLogger.storage.warning(
+                "JSONStore read failed at \(self.url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public). Devolviendo default sin tocar el archivo."
+            )
+            return defaultValue
+        }
+        do {
             return try decoder.decode(T.self, from: data)
         } catch {
             AppLogger.storage.warning(
-                "JSONStore corrupted at \(self.url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public). Reseteando a default."
+                "JSONStore corrupted at \(self.url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public). Apartando a .corrupt y devolviendo default."
             )
-            try? FileManager.default.removeItem(at: url)
+            quarantineCorruptFile()
             return defaultValue
+        }
+    }
+
+    /// Aparta el archivo ilegible a `<nombre>.json.corrupt` (reemplazando una
+    /// cuarentena anterior si existía). Conservarlo permite recuperar los datos
+    /// a mano si el "corrupto" era en realidad un esquema más nuevo/viejo.
+    private func quarantineCorruptFile() {
+        let backup = url.appendingPathExtension("corrupt")
+        try? FileManager.default.removeItem(at: backup)
+        do {
+            try FileManager.default.moveItem(at: url, to: backup)
+        } catch {
+            AppLogger.storage.error(
+                "quarantine failed for \(self.url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

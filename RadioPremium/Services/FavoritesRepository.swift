@@ -121,12 +121,23 @@ actor FavoritesRepository {
         // es síncrono pero al menos solicita el pull.
         kv.synchronize()
 
-        if let data = kv.data(forKey: kvKey),
-           let remoteStations = try? JSONDecoder().decode([Station].self, from: data) {
-            AppLogger.storage.info("iCloud has \(remoteStations.count, privacy: .public) favorites — merging")
-            await applyIcloudStations(remoteStations)
+        if let data = kv.data(forKey: kvKey) {
+            do {
+                let remoteStations = try JSONDecoder().decode([Station].self, from: data)
+                AppLogger.storage.info("iCloud has \(remoteStations.count, privacy: .public) favorites — merging")
+                await applyIcloudStations(remoteStations)
+            } catch {
+                // iCloud TIENE datos pero no los entendemos (blob corrupto o
+                // formato de una versión futura de la app). Antes esto caía en
+                // la rama "vacío" y PUSHEÁBAMOS lo local, machacando el remoto
+                // y propagando la pérdida al resto de dispositivos. Ahora: log
+                // y no tocar nada (igual que hace la versión iOS).
+                AppLogger.storage.error(
+                    "iCloud favorites decode failed: \(error.localizedDescription, privacy: .public) — conservando el remoto intacto"
+                )
+            }
         } else {
-            // iCloud vacío: pusheamos lo que tengamos local (primera vez).
+            // iCloud vacío de verdad: pusheamos lo que tengamos local (primera vez).
             let all = await store.load()
             if !all.isEmpty {
                 AppLogger.storage.info("iCloud empty, seeding with \(all.count, privacy: .public) local favorites")
@@ -149,7 +160,14 @@ actor FavoritesRepository {
                 merged.append(FavoriteEntry(station: station, addedAt: now))
             }
         }
-        try? await store.save(merged)
+        do {
+            try await store.save(merged)
+        } catch {
+            // Único punto del archivo que tragaba el error sin log.
+            AppLogger.storage.error(
+                "saving merged iCloud favorites failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     /// Pushea el array de Stations a iCloud KV (drop addedAt — iCloud solo guarda
