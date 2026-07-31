@@ -25,12 +25,26 @@
 #
 # Aquel apaño de firma manual existía para esquivar otro error:
 #   "resource fork, Finder information, or similar detritus not allowed"
-# que salta porque el proyecto vive en ~/Documents = iCloud Drive, e iCloud
-# añade xattrs que codesign rechaza.
 #
-# La raíz era el sitio del build, no la firma. Compilando en /tmp (fuera de
-# iCloud) no hay detritus, así que Xcode puede firmar él mismo — expandiendo
-# los entitlements correctamente. Se elimina toda la firma manual.
+# Causa comprobada: ~/Documents está enganchado a un dominio de File Provider
+# (el mecanismo de sincronización en la nube de macOS). Tiene los xattrs
+# `com.apple.file-provider-domain-id` y `com.apple.fileprovider.detached`, y
+# los directorios creados ahí dentro salen marcados con
+# `com.apple.fileprovider.dir` — más `com.apple.quarantine` en Assets.xcassets.
+# codesign rechaza justo esos como "detritus".
+#
+# Como el script antiguo compilaba en $PROJECT_ROOT/build, es decir DENTRO de
+# esa carpeta, el bundle recién creado nacía marcado y la firma fallaba.
+#
+# La raíz era el sitio del build, no la firma. Compilando en /tmp — fuera del
+# árbol del File Provider — el bundle sale limpio (solo com.apple.provenance,
+# que codesign sí acepta), así que Xcode puede firmar él mismo y expandir los
+# entitlements correctamente. Se elimina toda la firma manual.
+#
+# NOTA: no es iCloud Drive en sentido estricto. `brctl status` sobre esta ruta
+# responde "Client zone not found", y ~/Documents figura como *detached*. Lo
+# que importa no es qué servicio sea, sino que haya un File Provider marcando
+# lo que se crea dentro.
 #
 # El script verifica ambas cosas antes de instalar, y si la app nueva no
 # arranca restaura la anterior automáticamente.
@@ -99,13 +113,22 @@ done
 
 cd "$PROJECT_ROOT"
 
-# === Avisar si el proyecto está en iCloud ============================
-case "$PROJECT_ROOT" in
-    "$HOME/Documents"/*|"$HOME/Desktop"/*|*"/Mobile Documents/"*)
-        warn "El proyecto vive en una carpeta sincronizada con iCloud."
-        warn "Por eso compilamos en $BUILD_DIR y no aquí dentro."
-        ;;
-esac
+# === Avisar si el proyecto está bajo un File Provider ================
+# Se comprueba el xattr de verdad en vez de adivinar por la ruta: lo que
+# ensucia el bundle es el File Provider, no que la carpeta se llame Documents.
+check_fileprovider() {
+    local dir="$PROJECT_ROOT"
+    while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+        if xattr "$dir" 2>/dev/null | grep -q "file-provider-domain-id\|fileprovider"; then
+            warn "El proyecto está bajo un dominio de File Provider (sincronización en la nube): $dir"
+            warn "Los bundles creados ahí nacen con xattrs que codesign rechaza."
+            warn "Por eso se compila en $BUILD_DIR y no dentro del proyecto."
+            return
+        fi
+        dir="$(dirname "$dir")"
+    done
+}
+check_fileprovider
 
 # === Build Release, firmado por Xcode ================================
 # La app se cierra DESPUÉS de compilar, no antes: así te sigue funcionando
