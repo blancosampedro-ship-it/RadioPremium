@@ -14,6 +14,10 @@ import os
 actor IdentifiedTracksRepository {
     private let store: JSONStore<[IdentifiedTrackHistory]>
 
+    /// Tope del historial. Sin él crecía para siempre y el archivo entero se
+    /// reescribía en cada append. Mismo patrón que RecentStationsStore.
+    private let maxEntries = 1000
+
     /// Init estándar: persiste en Application Support/.../identified-tracks.json.
     init() throws {
         self.store = try JSONStore(filename: "identified-tracks", defaultValue: [])
@@ -31,9 +35,14 @@ actor IdentifiedTracksRepository {
     }
 
     /// Añade una entrada al historial. Persiste atómicamente.
+    /// Si se supera `maxEntries`, se descartan las más antiguas.
     func append(_ entry: IdentifiedTrackHistory) async throws {
         var all = await store.load()
         all.append(entry)
+        if all.count > maxEntries {
+            all.sort { $0.identifiedAt < $1.identifiedAt }
+            all.removeFirst(all.count - maxEntries)
+        }
         try await store.save(all)
         AppLogger.identify.info("history append \(entry.track.title, privacy: .public) total=\(all.count, privacy: .public)")
     }

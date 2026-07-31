@@ -214,9 +214,12 @@ actor SpotifyApiClient {
         do {
             return try await http.get(url, headers: ["Authorization": "Bearer \(token)"])
         } catch RadioPremiumError.httpStatus(401, _) {
-            // Token quizá rechazado (revocado / cambio scope). Forzar refresh + 1 retry.
+            // Token rechazado server-side (revocado / cambio scope). OJO:
+            // getValidAccessToken aquí devolvía el MISMO token cacheado (aún
+            // "válido" según el reloj local) y el retry repetía el 401.
+            // forceRefreshedAccessToken refresca de verdad.
             AppLogger.spotify.warning("401 from Spotify, forcing token refresh + retry")
-            let fresh = try await auth.getValidAccessToken()
+            let fresh = try await auth.forceRefreshedAccessToken()
             return try await http.get(url, headers: ["Authorization": "Bearer \(fresh)"])
         }
     }

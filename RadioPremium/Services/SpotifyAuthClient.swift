@@ -124,7 +124,7 @@ actor SpotifyAuthClient {
     /// Devuelve un access token usable. Si está expirado o a punto, lo refresca.
     /// Si refresh falla → signOut + lanza spotifyAuthRequired.
     func getValidAccessToken() async throws -> String {
-        guard var tokens = await loadTokens() else {
+        guard let tokens = await loadTokens() else {
             throw RadioPremiumError.spotifyAuthRequired
         }
 
@@ -133,6 +133,25 @@ actor SpotifyAuthClient {
         }
 
         AppLogger.spotify.debug("access token expired, refreshing")
+        return try await refreshAndPersist(tokens)
+    }
+
+    /// Fuerza un refresh real contra Spotify aunque el token local no haya
+    /// expirado. Para el retry tras un 401: un token revocado server-side sigue
+    /// pareciendo "válido" según el reloj local, y getValidAccessToken lo
+    /// devolvía cacheado tal cual — el retry fallaba con el mismo 401.
+    func forceRefreshedAccessToken() async throws -> String {
+        guard let tokens = await loadTokens() else {
+            throw RadioPremiumError.spotifyAuthRequired
+        }
+        AppLogger.spotify.debug("forcing token refresh (server rejected current token)")
+        return try await refreshAndPersist(tokens)
+    }
+
+    /// Refresca contra /api/token, mergea con los tokens actuales y persiste.
+    /// Si el refresh falla → signOut + spotifyAuthRequired.
+    private func refreshAndPersist(_ current: SpotifyTokens) async throws -> String {
+        var tokens = current
         do {
             let refreshed = try await refreshTokens(refreshToken: tokens.refreshToken)
             // Spotify a veces no devuelve un nuevo refresh_token en la respuesta;
@@ -186,27 +205,45 @@ actor SpotifyAuthClient {
 
     // MARK: - ASWebAuthenticationSession
 
+    /// Referencia a la sesión web activa, para poder cancelarla si la Task
+    /// muere. Solo se accede desde MainActor.
+    private final class WebAuthSessionHolder: @unchecked Sendable {
+        var session: ASWebAuthenticationSession?
+    }
+
     @MainActor
     private func openAuthSession(authURL: URL) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(
-                url: authURL,
-                callbackURLScheme: "radiopremium"
-            ) { callbackURL, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
+        let holder = WebAuthSessionHolder()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let session = ASWebAuthenticationSession(
+                    url: authURL,
+                    callbackURLScheme: "radiopremium"
+                ) { callbackURL, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    guard let callbackURL else {
+                        continuation.resume(throwing: RadioPremiumError.spotifyAuthFailed(reason: "callback nil"))
+                        return
+                    }
+                    continuation.resume(returning: callbackURL)
                 }
-                guard let callbackURL else {
-                    continuation.resume(throwing: RadioPremiumError.spotifyAuthFailed(reason: "callback nil"))
-                    return
+                session.presentationContextProvider = AuthPresentationProvider.shared
+                session.prefersEphemeralWebBrowserSession = false
+                holder.session = session
+                if !session.start() {
+                    continuation.resume(throwing: RadioPremiumError.spotifyAuthFailed(reason: "session.start() devolvió false"))
                 }
-                continuation.resume(returning: callbackURL)
             }
-            session.presentationContextProvider = AuthPresentationProvider.shared
-            session.prefersEphemeralWebBrowserSession = false
-            if !session.start() {
-                continuation.resume(throwing: RadioPremiumError.spotifyAuthFailed(reason: "session.start() devolvió false"))
+        } onCancel: {
+            // Sin esto, cancelar la Task dejaba la ventana de login huérfana y
+            // la continuation suspendida hasta que el usuario la cerrase a mano
+            // (y reintentar abría una SEGUNDA ventana encima). session.cancel()
+            // dispara el completion con canceledLogin y todo se desmonta limpio.
+            Task { @MainActor in
+                holder.session?.cancel()
             }
         }
     }

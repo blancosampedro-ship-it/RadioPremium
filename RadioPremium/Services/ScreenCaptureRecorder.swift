@@ -137,12 +137,22 @@ final class ScreenCaptureRecorder: Sendable {
         let stepCount = 20
         let stepMs = max(1, Int((totalSeconds * 1000) / Double(stepCount)))
 
-        for step in 1...stepCount {
-            try await Task.sleep(for: .milliseconds(stepMs))
-            if let onProgress {
-                let p = Double(step) / Double(stepCount)
-                onProgress(p)
+        do {
+            for step in 1...stepCount {
+                try await Task.sleep(for: .milliseconds(stepMs))
+                if let onProgress {
+                    let p = Double(step) / Double(stepCount)
+                    onProgress(p)
+                }
             }
+        } catch {
+            // Cancelar (botón Cancelar/Reintentar) lanza desde Task.sleep. Sin
+            // este stop, la función salía propagando el error y el SCStream
+            // seguía capturando (con el indicador de grabación encendido) hasta
+            // que su deinit quisiera; en un retry inmediato convivían dos streams.
+            try? await stream.stopCapture()
+            AppLogger.identify.info("capture interrumpida — stream parado antes de propagar")
+            throw error
         }
 
         // 6. Parar y recopilar resultado.
