@@ -10,7 +10,7 @@ App macOS menubar nativa, instalada en `/Applications/Radio Premium.app`. Funcio
 
 | Concepto | Valor |
 |---|---|
-| **Repo de código** | `/Users/winfin/Documents/LENOVO1/Radio360/radiopremium xcode/RadioPremium/` |
+| **Repo de código** | `/Users/winfin/RadioPremium/` |
 | **Bundle ID** | `com.blancosampedro.RadioPremium` |
 | **Team ID Apple Developer** | `886836VWWK` (Juan Blanco) |
 | **Apple ID asociado** | `twetter@gmail.com` |
@@ -129,12 +129,12 @@ RadioPremium.xcodeproj                ← config build, signing, INFOPLIST_KEY_*
 
 ### Cambio rápido y test (durante desarrollo)
 
-Abre el proyecto en Xcode (`open "/Users/winfin/Documents/LENOVO1/Radio360/radiopremium xcode/RadioPremium/RadioPremium.xcodeproj"`), edita, `Cmd+R` para correr Debug. Esa es una build aparte que vive en DerivedData, no toca la de `/Applications`.
+Abre el proyecto en Xcode (`open "/Users/winfin/RadioPremium/RadioPremium.xcodeproj"`), edita, `Cmd+R` para correr Debug. Esa es una build aparte que vive en DerivedData, no toca la de `/Applications`.
 
 ### Reinstalar la versión en /Applications con tus cambios
 
 ```bash
-cd "/Users/winfin/Documents/LENOVO1/Radio360/radiopremium xcode/RadioPremium"
+cd "/Users/winfin/RadioPremium"
 ./scripts/install-locally.sh
 ```
 
@@ -186,7 +186,7 @@ Los archivos con claves API:
 
 Si pasa tiempo y quieres retomar, los puntos de entrada útiles:
 
-- Para abrir el proyecto: `open "/Users/winfin/Documents/LENOVO1/Radio360/radiopremium xcode/RadioPremium/RadioPremium.xcodeproj"`.
+- Para abrir el proyecto: `open "/Users/winfin/RadioPremium/RadioPremium.xcodeproj"`.
 - Para ejecutar todos los tests: en Xcode `Cmd+U`, o por terminal `xcodebuild -scheme RadioPremium -destination "platform=macOS" test -only-testing:RadioPremiumTests`.
 - Para ver los logs en vivo: Console.app → filter `subsystem:com.blancosampedro.RadioPremium`.
 - Para reinstalar: `./scripts/install-locally.sh`.
