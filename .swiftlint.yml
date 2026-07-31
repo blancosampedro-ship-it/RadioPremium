@@ -1,0 +1,55 @@
+# Configuración SwiftLint de RadioPremium.
+#
+# Calibrada tras la auditoría del 31-jul-2026: la configuración de fábrica
+# generaba 175 avisos de los que ~120 eran ruido (nombres cortos idiomáticos,
+# líneas de 121-160 chars, reglas pensadas para equipos grandes). Esta config
+# deja visible solo lo que de verdad merece atención en este proyecto.
+
+excluded:
+  - build
+  - .build
+  - "*/DerivedData"
+
+disabled_rules:
+  # Múltiples trailing closures es idiomático en SwiftUI (Button { } label: { }).
+  - multiple_closures_with_trailing_closure
+  # Los clients anidan sus DTOs privados de respuesta a propósito (AppleMusicClient).
+  - nesting
+
+identifier_name:
+  # Nombres de 1-2 letras son idiomáticos en closures cortos, índices y tests
+  # (i, s, p, v, vm, kv, cc, q…). No convertirlos en errores.
+  min_length:
+    warning: 1
+  max_length:
+    warning: 50
+    error: 60
+
+line_length:
+  warning: 140
+  error: 200
+  ignores_comments: true
+  ignores_urls: true
+
+file_length:
+  warning: 500
+  error: 800
+
+type_body_length:
+  warning: 300
+  error: 500
+
+function_body_length:
+  warning: 60
+  error: 120
+
+cyclomatic_complexity:
+  # 13 cubre los multi-catch exhaustivos de errores de dominio (Spotify/AppleMusic),
+  # que son legibles. runFlow() con 19 sigue saltando — ese sí merece refactor.
+  warning: 13
+  error: 25
+
+type_name:
+  # Los targets de plantilla de Xcode usan guion bajo (RadioPremium_iOSApp).
+  # Pendiente de rename; mientras tanto, que no sea error.
+  allowed_symbols: ["_"]
