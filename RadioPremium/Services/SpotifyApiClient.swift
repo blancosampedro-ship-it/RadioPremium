@@ -40,6 +40,20 @@ actor SpotifyApiClient {
         try await authedGet("/v1/me")
     }
 
+    // MARK: - Lookup directo por ID
+
+    /// Trae un track por su ID de catálogo. Devuelve `nil` si Spotify no lo
+    /// conoce (404). Usado para confirmar el ID que nos da ACRCloud.
+    func trackById(_ id: String) async throws -> SpotifyTrack? {
+        let url = try makeURL(pathWithQuery: "/v1/tracks/\(id)")
+        do {
+            let track: SpotifyTrack = try await authedGetURL(url)
+            return track
+        } catch RadioPremiumError.httpStatus(404, _) {
+            return nil
+        }
+    }
+
     // MARK: - Search
 
     /// Búsqueda exacta por ISRC (International Standard Recording Code).
@@ -51,16 +65,73 @@ actor SpotifyApiClient {
         return response.tracks?.items.first
     }
 
-    /// Búsqueda por título y artista. Fallback cuando no hay ISRC o no matchea.
-    /// Filtros explícitos `track:` y `artist:` mejoran precisión vs texto libre.
-    /// Confiamos en el ranking de Spotify y devolvemos el primer resultado.
+    /// Búsqueda por título y artista con filtros de campo.
+    ///
+    /// Los valores van ENTRECOMILLADOS a propósito: en la sintaxis de Spotify
+    /// un filtro sin comillas solo captura la palabra siguiente, así que
+    /// `track:Sing It Back artist:Kevin McKay` preguntaba en realidad por una
+    /// canción llamada "Sing" de un artista llamado "Kevin".
     func findTrack(title: String, artist: String) async throws -> SpotifyTrack? {
-        let cleanTitle = title.replacingOccurrences(of: "\"", with: "")
-        let cleanArtist = artist.replacingOccurrences(of: "\"", with: "")
-        let query = "track:\(cleanTitle) artist:\(cleanArtist)"
+        let cleanTitle = Self.sanitize(title)
+        let cleanArtist = Self.sanitize(artist)
+        let query = "track:\"\(cleanTitle)\" artist:\"\(cleanArtist)\""
         let url = try buildSearchURL(query: query, limit: 5)
         let response: SpotifySearchResponse = try await authedGetURL(url)
         return response.tracks?.items.first
+    }
+
+    /// Búsqueda en texto libre, sin filtros de campo — el mismo enfoque que usa
+    /// Apple Music. Último recurso: los filtros exigen que el título coincida
+    /// casi literalmente, y ACRCloud y Spotify nombran las versiones distinto
+    /// ("Sing It Back (Extended Feel Love Mix)" vs "Sing It Back - (I Feel Love)").
+    /// Aquí mandamos el título sin el sufijo de versión y el artista principal.
+    func findTrackFreeText(title: String, artist: String) async throws -> SpotifyTrack? {
+        let core = Self.searchableTitle(title)
+        let primary = Self.primaryArtist(artist)
+        guard !core.isEmpty else { return nil }
+        let query = Self.sanitize("\(core) \(primary)")
+        let url = try buildSearchURL(query: query, limit: 5)
+        let response: SpotifySearchResponse = try await authedGetURL(url)
+        return response.tracks?.items.first
+    }
+
+    // MARK: - Normalización para búsqueda
+
+    /// Quita comillas, que romperían la query.
+    static func sanitize(_ value: String) -> String {
+        value.replacingOccurrences(of: "\"", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Título sin sufijos de versión: quita grupos entre paréntesis o corchetes
+    /// —"(Extended Mix)", "[Radio Edit]", "(feat. X)"— y lo que siga a " - ".
+    /// Si al quitarlo no queda nada, devuelve el título original.
+    static func searchableTitle(_ title: String) -> String {
+        var result = title.replacingOccurrences(
+            of: #"\s*[\(\[][^\)\]]*[\)\]]"#,
+            with: "",
+            options: .regularExpression
+        )
+        if let dash = result.range(of: " - ") {
+            result = String(result[..<dash.lowerBound])
+        }
+        result = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.isEmpty ? title.trimmingCharacters(in: .whitespacesAndNewlines) : result
+    }
+
+    /// Artista principal: ACRCloud encadena colaboradores ("S.A.M., Sarah Ikumu")
+    /// y a veces cuela créditos de remix ("Majed/Luna Orbit/Master Produções").
+    /// Para buscar, el primero es el que más ayuda.
+    static func primaryArtist(_ artist: String) -> String {
+        let separators = CharacterSet(charactersIn: ",/&")
+        let first = artist.components(separatedBy: separators).first ?? artist
+        let withoutFeat = first.replacingOccurrences(
+            of: #"\s+(feat\.?|ft\.?|featuring)\s+.*$"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        let trimmed = withoutFeat.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? artist.trimmingCharacters(in: .whitespacesAndNewlines) : trimmed
     }
 
     // MARK: - Playlists
@@ -145,36 +216,57 @@ actor SpotifyApiClient {
     /// Devuelve URIs estilo `spotify:track:XXXX`. Lanza `.spotifyTrackNotFound`
     /// si Spotify no encuentra match ni por ISRC ni por título+artista.
     func findTrackUri(for track: Track) async throws -> String {
-        var spotifyTrack: SpotifyTrack?
-        if let isrc = track.isrc, !isrc.isEmpty {
-            spotifyTrack = try await findTrackByISRC(isrc)
+        try await resolveTrack(for: track).uri
+    }
+
+    /// Localiza el track en Spotify probando, en orden de fiabilidad:
+    ///
+    ///   1. **El ID que ya nos dio ACRCloud** (`external_metadata.spotify.track.id`).
+    ///      Es exacto y cubre ~80% de las identificaciones. Antes se ignoraba por
+    ///      completo y se iba directo a buscar por texto, que fallaba en cuanto el
+    ///      título llevaba un sufijo de versión.
+    ///   2. ISRC, también exacto (aunque ACRCloud rara vez lo incluye).
+    ///   3. Filtros `track:`/`artist:` entrecomillados.
+    ///   4. Texto libre con el título sin sufijo de versión, como hace Apple Music.
+    ///
+    /// Lanza `.spotifyTrackNotFound` si ninguna vía da resultado.
+    private func resolveTrack(for track: Track) async throws -> SpotifyTrack {
+        if let id = track.spotifyId, !id.isEmpty {
+            // Se confirma contra /v1/tracks para no propagar un ID muerto; si no
+            // resuelve, seguimos con el resto de vías en lugar de rendirnos.
+            if let confirmed = try await trackById(id) {
+                AppLogger.spotify.debug("resuelto por ID de ACRCloud: \(id, privacy: .public)")
+                return confirmed
+            }
+            AppLogger.spotify.warning("el ID de ACRCloud \(id, privacy: .public) no resolvió — probando búsqueda")
         }
-        if spotifyTrack == nil {
-            spotifyTrack = try await findTrack(title: track.title, artist: track.artist)
+
+        if let isrc = track.isrc, !isrc.isEmpty,
+           let byIsrc = try await findTrackByISRC(isrc) {
+            AppLogger.spotify.debug("resuelto por ISRC")
+            return byIsrc
         }
-        guard let st = spotifyTrack else {
-            throw RadioPremiumError.spotifyTrackNotFound(query: track.displayText)
+
+        if let byFields = try await findTrack(title: track.title, artist: track.artist) {
+            AppLogger.spotify.debug("resuelto por título+artista")
+            return byFields
         }
-        return st.uri
+
+        if let byText = try await findTrackFreeText(title: track.title, artist: track.artist) {
+            AppLogger.spotify.debug("resuelto por texto libre")
+            return byText
+        }
+
+        throw RadioPremiumError.spotifyTrackNotFound(query: track.displayText)
     }
 
     /// Flujo completo: encuentra el track en Spotify (ISRC primero, fallback
     /// title+artist), busca/crea la playlist "Radio Likes", añade el track.
     /// Lanza `.spotifyTrackNotFound` si no existe en Spotify.
     func addTrackToRadioLikes(_ track: Track) async throws -> SpotifyAddOutcome {
-        var spotifyTrack: SpotifyTrack?
-        if let isrc = track.isrc, !isrc.isEmpty {
-            spotifyTrack = try await findTrackByISRC(isrc)
-        }
-        if spotifyTrack == nil {
-            spotifyTrack = try await findTrack(title: track.title, artist: track.artist)
-        }
-        guard let st = spotifyTrack else {
-            throw RadioPremiumError.spotifyTrackNotFound(query: track.displayText)
-        }
-
+        let spotifyTrack = try await resolveTrack(for: track)
         let playlist = try await findOrCreatePlaylist(named: SpotifyConstants.radioLikesPlaylistName)
-        return try await addTrackToPlaylist(playlistId: playlist.id, trackUri: st.uri)
+        return try await addTrackToPlaylist(playlistId: playlist.id, trackUri: spotifyTrack.uri)
     }
 
     // MARK: - Internals

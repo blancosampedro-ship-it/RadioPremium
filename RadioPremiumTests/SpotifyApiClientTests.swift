@@ -146,7 +146,7 @@ final class SpotifyApiClientTests: XCTestCase {
 
     // MARK: - Search by title+artist
 
-    func testFindTrack_buildsTrackArtistQuery() async throws {
+    func testFindTrack_buildsQuotedTrackArtistQuery() async throws {
         setOKHandler(body: Self.emptyTracksJSON)
         _ = try await client.findTrack(title: "Bohemian Rhapsody", artist: "Queen")
 
@@ -154,11 +154,14 @@ final class SpotifyApiClientTests: XCTestCase {
             .flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
             .queryItems?
             .first { $0.name == "q" }?.value
-        XCTAssertEqual(q, "track:Bohemian Rhapsody artist:Queen")
+        // Los valores DEBEN ir entrecomillados: sin comillas, Spotify aplica el
+        // filtro solo a la palabra siguiente y `track:Bohemian Rhapsody` acaba
+        // preguntando por una canción llamada "Bohemian".
+        XCTAssertEqual(q, "track:\"Bohemian Rhapsody\" artist:\"Queen\"")
     }
 
     func testFindTrack_stripsQuotesFromInput() async throws {
-        // Input con comillas se sanea para evitar romper la query Spotify.
+        // Input con comillas se sanea para no romper el entrecomillado.
         setOKHandler(body: Self.emptyTracksJSON)
         _ = try await client.findTrack(title: "Bo\"hemian", artist: "Qu\"een")
 
@@ -166,7 +169,7 @@ final class SpotifyApiClientTests: XCTestCase {
             .flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
             .queryItems?
             .first { $0.name == "q" }?.value
-        XCTAssertEqual(q, "track:Bohemian artist:Queen")
+        XCTAssertEqual(q, "track:\"Bohemian\" artist:\"Queen\"")
     }
 
     func testFindTrack_returnsFirstResult() async throws {
@@ -286,6 +289,138 @@ final class SpotifyApiClientTests: XCTestCase {
     // revocados server-side. Difícil de mockear limpiamente sin el proactive
     // refresh interfiriendo. La cobertura del refresh-on-expiry está en
     // SpotifyAuthClientTests.testGetValidAccessToken_refreshesWhenExpired.
+
+    // MARK: - Resolución del track (el ID de ACRCloud primero)
+
+    /// Registra los paths golpeados, para verificar QUÉ vía se usó.
+    private final class PathRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _paths: [String] = []
+        func record(_ path: String) { lock.lock(); defer { lock.unlock() }; _paths.append(path) }
+        var paths: [String] { lock.lock(); defer { lock.unlock() }; return _paths }
+    }
+
+    private static let trackByIdJSON = """
+    {
+        "id": "35nt3SIMscp0VqsVkBkawZ",
+        "name": "Sing It Back - (I Feel Love)",
+        "artists": [{"name": "Kevin McKay"}],
+        "uri": "spotify:track:35nt3SIMscp0VqsVkBkawZ"
+    }
+    """
+
+    /// El caso real del usuario: ACRCloud da el ID, el título NO coincide con el
+    /// de Spotify ("(Extended Feel Love Mix)" vs "- (I Feel Love)"). Antes se
+    /// ignoraba el ID y la búsqueda por texto devolvía vacío → "no encontrada".
+    func testFindTrackUri_usesAcrCloudSpotifyId_withoutSearching() async throws {
+        let recorder = PathRecorder()
+        MockURLProtocol.setHandler { request in
+            recorder.record(request.url?.path ?? "?")
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Self.trackByIdJSON.data(using: .utf8))
+        }
+
+        let track = Track(
+            title: "Sing It Back (Extended Feel Love Mix)",
+            artist: "Kevin McKay",
+            spotifyId: "35nt3SIMscp0VqsVkBkawZ"
+        )
+        let uri = try await client.findTrackUri(for: track)
+
+        XCTAssertEqual(uri, "spotify:track:35nt3SIMscp0VqsVkBkawZ")
+        XCTAssertEqual(
+            recorder.paths, ["/v1/tracks/35nt3SIMscp0VqsVkBkawZ"],
+            "Con ID de ACRCloud debe ir directo al track y NO tocar /v1/search."
+        )
+    }
+
+    func testFindTrackUri_fallsBackToSearch_whenAcrCloudIdIsDead() async throws {
+        let recorder = PathRecorder()
+        MockURLProtocol.setHandler { request in
+            let path = request.url?.path ?? "?"
+            recorder.record(path)
+            if path.hasPrefix("/v1/tracks/") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!
+                return (response, nil)
+            }
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Self.singleTrackSearchJSON.data(using: .utf8))
+        }
+
+        let track = Track(title: "Bohemian Rhapsody", artist: "Queen", spotifyId: "id-muerto")
+        let uri = try await client.findTrackUri(for: track)
+
+        XCTAssertEqual(uri, "spotify:track:track123")
+        XCTAssertTrue(recorder.paths.contains("/v1/tracks/id-muerto"))
+        XCTAssertTrue(recorder.paths.contains("/v1/search"), "Un ID muerto no debe abortar: sigue con la búsqueda.")
+    }
+
+    func testFindTrackUri_fallsBackToFreeText_whenFieldSearchFails() async throws {
+        let recorder = PathRecorder()
+        let queries = PathRecorder()
+        MockURLProtocol.setHandler { request in
+            recorder.record(request.url?.path ?? "?")
+            let q = request.url
+                .flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
+                .queryItems?.first { $0.name == "q" }?.value ?? ""
+            queries.record(q)
+            // La búsqueda con filtros devuelve vacío; la de texto libre acierta.
+            let body = q.contains("track:") ? Self.emptyTracksJSON : Self.singleTrackSearchJSON
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, body.data(using: .utf8))
+        }
+
+        let track = Track(title: "Sing It Back (Extended Feel Love Mix)", artist: "Kevin McKay, Someone Else")
+        let uri = try await client.findTrackUri(for: track)
+
+        XCTAssertEqual(uri, "spotify:track:track123")
+        XCTAssertEqual(
+            queries.paths.last, "Sing It Back Kevin McKay",
+            "El último intento debe ser texto libre: título sin sufijo + artista principal."
+        )
+    }
+
+    func testFindTrackUri_throwsNotFound_whenNothingMatches() async {
+        setOKHandler(body: Self.emptyTracksJSON)
+        let track = Track(title: "Cancion Inexistente", artist: "Nadie")
+
+        do {
+            _ = try await client.findTrackUri(for: track)
+            XCTFail("Esperaba spotifyTrackNotFound")
+        } catch RadioPremiumError.spotifyTrackNotFound(let query) {
+            XCTAssertEqual(query, "Nadie — Cancion Inexistente")
+        } catch {
+            XCTFail("Error incorrecto: \(error)")
+        }
+    }
+
+    // MARK: - Normalización para búsqueda
+
+    func testSearchableTitle_stripsVersionSuffixes() {
+        XCTAssertEqual(SpotifyApiClient.searchableTitle("Sing It Back (Extended Feel Love Mix)"), "Sing It Back")
+        XCTAssertEqual(
+            SpotifyApiClient.searchableTitle("Spotlight (feat. Sarah Ikumu) [Mousse T. Extended Shizzle Mix]"),
+            "Spotlight"
+        )
+        XCTAssertEqual(SpotifyApiClient.searchableTitle("Sing It Back - Radio Edit"), "Sing It Back")
+        XCTAssertEqual(SpotifyApiClient.searchableTitle("Icarus"), "Icarus", "Un título limpio no debe tocarse.")
+        XCTAssertEqual(
+            SpotifyApiClient.searchableTitle("(Everything I Do) I Do It For You"),
+            "I Do It For You",
+            "Si queda texto tras quitar el paréntesis, se usa ese."
+        )
+        XCTAssertEqual(
+            SpotifyApiClient.searchableTitle("(Reprise)"), "(Reprise)",
+            "Si quitarlo dejaría el título vacío, se conserva el original."
+        )
+    }
+
+    func testPrimaryArtist_takesFirstCredit() {
+        XCTAssertEqual(SpotifyApiClient.primaryArtist("S.A.M., Sarah Ikumu"), "S.A.M.")
+        XCTAssertEqual(SpotifyApiClient.primaryArtist("Majed/Luna Orbit/Master Produções Remix"), "Majed")
+        XCTAssertEqual(SpotifyApiClient.primaryArtist("Stefano Pain feat. Andrea Serratore"), "Stefano Pain")
+        XCTAssertEqual(SpotifyApiClient.primaryArtist("Queen"), "Queen")
+    }
 
     // MARK: - Fixtures
 
