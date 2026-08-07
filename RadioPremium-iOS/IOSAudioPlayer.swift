@@ -70,6 +70,7 @@ final class IOSAudioPlayer {
 
     func play(_ station: Station) {
         log.info("play station=\(station.name, privacy: .public) url=\(station.url.absoluteString, privacy: .public)")
+        activateAudioSession()
         let item = AVPlayerItem(url: station.url)
         observeItem(item)
         player.replaceCurrentItem(with: item)
@@ -100,6 +101,7 @@ final class IOSAudioPlayer {
             return
         }
         log.info("resume")
+        activateAudioSession()
         player.play()
     }
 
@@ -109,6 +111,8 @@ final class IOSAudioPlayer {
         player.replaceCurrentItem(with: nil)
         currentStation = nil
         state = .idle
+        // Devolver el audio a quien sonara antes (Apple Music, podcasts…).
+        deactivateAudioSession()
     }
 
     func togglePlayPause() {
@@ -120,14 +124,34 @@ final class IOSAudioPlayer {
 
     // MARK: - AudioSession setup
 
+    /// Solo la CATEGORÍA en el init. La activación se difiere a play()/resume():
+    /// activar una sesión .playback (no mezclable) INTERRUMPE el audio de otras
+    /// apps en ese instante — con CarPlay, abrir la app para mirar favoritos
+    /// silenciaba lo que sonara en el coche sin haber pulsado nada. La guía de
+    /// Apple es activar al empezar a reproducir, no al arrancar la app.
     private func configureAudioSession() {
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true)
-            log.debug("AVAudioSession configured for .playback")
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+            log.debug("AVAudioSession category .playback configurada")
         } catch {
-            log.error("AVAudioSession setup failed: \(error.localizedDescription, privacy: .public)")
+            log.error("AVAudioSession setCategory failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func activateAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            log.error("AVAudioSession activate failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func deactivateAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        } catch {
+            // Frecuente e inofensivo si AVPlayer aún drena I/O; solo log.
+            log.debug("AVAudioSession deactivate: \(error.localizedDescription, privacy: .public)")
         }
     }
 
