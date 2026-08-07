@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Entitlements para builds de SIMULADOR (ver CODE_SIGN_ENTITLEMENTS[sdk=iphonesimulator*]
+	en project.pbxproj). Idénticos a RadioPremium-iOS.entitlements MÁS el de CarPlay.
+
+	¿Por qué dos archivos? com.apple.developer.carplay-audio es un entitlement
+	RESTRINGIDO: Apple debe concederlo por solicitud expresa
+	(https://developer.apple.com/contact/carplay/). Hasta que lo conceda, un
+	perfil de firma normal no lo incluye y la build de DISPOSITIVO fallaría al
+	firmar. El simulador no valida perfiles, así que ahí sí podemos activarlo
+	y probar CarPlay (Simulator → I/O → External Displays → CarPlay).
+
+	Cuando Apple conceda el permiso: copiar la clave carplay-audio a
+	RadioPremium-iOS.entitlements, regenerar el perfil, y la app aparecerá
+	en el coche real.
+	-->
+	<key>com.apple.developer.carplay-audio</key>
+	<true/>
+	<key>com.apple.developer.icloud-extended-share-access</key>
+	<array/>
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>$(TeamIdentifierPrefix)com.blancosampedro.RadioPremium</string>
+</dict>
+</plist>

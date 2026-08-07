@@ -9,7 +9,9 @@ import SwiftUI
 
 @main
 struct RadioPremium_iOSApp: App {
-    @State private var model = AppModel()
+    /// La instancia compartida — la escena CarPlay usa la misma, así que el
+    /// coche y el iPhone controlan el mismo player y los mismos favoritos.
+    private let model = AppModel.shared
 
     var body: some Scene {
         WindowGroup {

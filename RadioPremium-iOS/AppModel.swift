@@ -15,6 +15,11 @@ import os
 @Observable
 final class AppModel {
 
+    /// Instancia única compartida entre la escena del iPhone (SwiftUI) y la
+    /// escena CarPlay. Ambas interfaces controlan EL MISMO player y los mismos
+    /// favoritos: pulsar play en el coche se refleja en el iPhone y viceversa.
+    static let shared = AppModel()
+
     let player: IOSAudioPlayer
     let favorites: FavoritesStore
     private let api: RadioBrowserAPI

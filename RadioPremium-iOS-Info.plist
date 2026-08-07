@@ -26,5 +26,31 @@
 	<array>
 		<string>audio</string>
 	</array>
+
+	<!--
+	Escena CarPlay. Declarada aquí (no vía INFOPLIST_KEY_..._Generation, que
+	se desactiva en el pbxproj) por el mismo problema de fusión que
+	UIBackgroundModes: cuando la clave existe en ambos sitios, el resultado
+	no es fiable. La escena de la app del iPhone no se declara — SwiftUI la
+	aporta sola. UIApplicationSupportsMultipleScenes = true es obligatorio
+	para que coche y teléfono muestren interfaz A LA VEZ.
+	-->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>CPTemplateApplicationSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>CarPlay</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).CarPlaySceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 </dict>
 </plist>
