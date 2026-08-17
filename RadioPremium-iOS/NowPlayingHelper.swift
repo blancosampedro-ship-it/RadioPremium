@@ -32,9 +32,22 @@ final class NowPlayingHelper {
             return
         }
 
+        // El subtítulo es lo único que el coche puede contarte mientras
+        // conduces: durante una reconexión debe decirlo, no quedarse mudo.
+        let subtitle: String = {
+            switch state {
+            case .reconnecting(let attempt):
+                return attempt == 1 ? "Reconectando…" : "Reconectando… (\(attempt))"
+            case .buffering:
+                return "Conectando…"
+            default:
+                return station.country ?? "Radio Premium"
+            }
+        }()
+
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: station.name,
-            MPMediaItemPropertyArtist: station.country ?? "Radio Premium",
+            MPMediaItemPropertyArtist: subtitle,
             MPNowPlayingInfoPropertyIsLiveStream: true,
             MPNowPlayingInfoPropertyPlaybackRate: state == .playing ? 1.0 : 0.0,
         ]

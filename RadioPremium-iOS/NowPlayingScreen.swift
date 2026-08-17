@@ -102,6 +102,8 @@ struct NowPlayingScreen: View {
             case .buffering:   return ("Cargando…", .orange)
             case .playing:     return ("En directo", .green)
             case .paused:      return ("Pausado", .secondary)
+            case .reconnecting(let attempt):
+                return (attempt == 1 ? "Reconectando…" : "Reconectando… (\(attempt))", .orange)
             case .error(let r): return ("Error: \(r)", .red)
             }
         }()
@@ -134,8 +136,8 @@ struct NowPlayingScreen: View {
 
     private var playPauseIcon: String {
         switch model.player.state {
-        case .playing, .buffering: return "pause.circle.fill"
-        default:                   return "play.circle.fill"
+        case .playing, .buffering, .reconnecting: return "pause.circle.fill"
+        default:                                  return "play.circle.fill"
         }
     }
 
@@ -176,7 +178,7 @@ struct MiniPlayerBar: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 Button(action: { model.togglePlayPause() }) {
-                    Image(systemName: model.player.state == .playing || model.player.state == .buffering ? "pause.fill" : "play.fill")
+                    Image(systemName: model.player.state.isActive ? "pause.fill" : "play.fill")
                         .font(.title3)
                         .foregroundStyle(.tint)
                         .frame(width: 36, height: 36)
@@ -193,11 +195,12 @@ struct MiniPlayerBar: View {
 
     private var stateText: String {
         switch model.player.state {
-        case .idle:        return "Detenido"
-        case .buffering:   return "Cargando…"
-        case .playing:     return "En directo"
-        case .paused:      return "Pausado"
-        case .error:       return "Error"
+        case .idle:          return "Detenido"
+        case .buffering:     return "Cargando…"
+        case .playing:       return "En directo"
+        case .paused:        return "Pausado"
+        case .reconnecting:  return "Reconectando…"
+        case .error:         return "Error"
         }
     }
 
