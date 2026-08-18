@@ -96,8 +96,12 @@ final class IOSAudioPlayer {
     private var reconnectTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
 
-    /// Instante en que dejamos de oír audio de verdad. nil mientras suena.
+    /// Instante desde el que NO entra ni un byte. nil mientras haya progreso.
     private var stalledSince: Date?
+
+    /// Final del buffer cargado en la última comprobación. Si crece, están
+    /// llegando datos aunque no suene — señal floja, pero stream vivo.
+    private var lastBufferedEnd: TimeInterval = 0
 
     // Red
     private let pathMonitor = NWPathMonitor()
@@ -105,10 +109,16 @@ final class IOSAudioPlayer {
     /// Continuations esperando a que vuelva la red (las despierta el monitor).
     private var networkWaiters: [CheckedContinuation<Void, Never>] = []
 
-    /// Cuánto tolera el watchdog sin audio antes de dar el stream por muerto.
-    /// Por debajo de ~10 s nos pelearíamos con los micro-cortes que el buffer
-    /// tapa solo; por encima, el silencio en el coche se hace largo.
-    private let stallToleranceSeconds: TimeInterval = 12
+    /// Cuánto se tolera SIN QUE ENTRE NADA antes de dar el stream por muerto.
+    /// Ojo: no es "sin oír audio" — con señal débil AVPlayer deja de sonar
+    /// mientras rellena el buffer, y eso es normal y recuperable. Este reloj
+    /// solo corre cuando no llega ni un byte, que sí es un stream muerto.
+    private let stallToleranceSeconds: TimeInterval = 30
+
+    /// Margen para que un stream recién abierto arranque. Con cobertura pobre
+    /// AVPlayer puede tardar bastante en tener buffer suficiente; rendirse
+    /// antes solo provoca reconexiones en cadena que arrancan igual de mal.
+    private let startupGraceSeconds = 25
 
     /// Colchón que pedimos conservar. El servidor manda lo que quiera (7-18 s
     /// en las emisoras medidas); esto solo evita que iOS lo recorte.
@@ -203,6 +213,7 @@ final class IOSAudioPlayer {
         observeItem(item)
         player.replaceCurrentItem(with: item)
         stalledSince = nil
+        lastBufferedEnd = 0
         if case .reconnecting = state {} else { state = .buffering }
         player.play()
     }
@@ -230,26 +241,58 @@ final class IOSAudioPlayer {
     }
 
     private func checkForStall() {
-        guard shouldBePlaying else { return }
+        guard shouldBePlaying, currentStation != nil else { return }
         if case .reconnecting = state { return }  // ya se está reintentando
+        guard let item = player.currentItem else { return }
 
-        let item = player.currentItem
-        // "Sale audio" = el player avanza y el buffer no está seco.
-        let flowing = player.timeControlStatus == .playing
-            && !(item?.isPlaybackBufferEmpty ?? true)
-
-        if flowing {
-            stalledSince = nil
+        // 1. Suena de verdad → sano.
+        if player.timeControlStatus == .playing {
+            noteProgress()
             return
         }
 
+        // 2. Sin red no es culpa del stream. El monitor de red disparará la
+        //    reconexión en cuanto vuelva; no acumular tiempo muerto aquí.
+        if !isNetworkUp {
+            noteProgress()
+            return
+        }
+
+        // 3. ¿Entran datos aunque no suene? Con cobertura pobre AVPlayer para
+        //    la reproducción y sigue rellenando el buffer: el stream está VIVO,
+        //    solo va despacio. Matarlo aquí era el bug — forzaba una reconexión
+        //    que, con la misma señal floja, arrancaba igual de mal o peor.
+        if bufferIsGrowing(item) {
+            noteProgress()
+            return
+        }
+
+        // 4. Ni suena ni entra nada: ahora sí corre el reloj.
         let since = stalledSince ?? Date()
         if stalledSince == nil { stalledSince = since }
-
-        if Date().timeIntervalSince(since) >= stallToleranceSeconds {
-            log.error("watchdog: sin audio \(Int(self.stallToleranceSeconds), privacy: .public)s — el stream está muerto, reconectando")
+        let dead = Date().timeIntervalSince(since)
+        if dead >= stallToleranceSeconds {
+            log.error("watchdog: \(Int(dead), privacy: .public)s sin datos ni audio — stream muerto, reconectando")
             beginReconnect()
         }
+    }
+
+    /// `true` si el final del buffer cargado ha avanzado desde la última
+    /// comprobación — o sea, si están llegando bytes.
+    private func bufferIsGrowing(_ item: AVPlayerItem) -> Bool {
+        let end = item.loadedTimeRanges
+            .map { CMTimeGetSeconds($0.timeRangeValue.end) }
+            .filter { $0.isFinite }
+            .max() ?? 0
+        if end > lastBufferedEnd + 0.2 {
+            lastBufferedEnd = end
+            return true
+        }
+        return false
+    }
+
+    private func noteProgress() {
+        stalledSince = nil
     }
 
     // MARK: - Reconexión automática
@@ -282,14 +325,15 @@ final class IOSAudioPlayer {
                 item.preferredForwardBufferDuration = self.forwardBufferSeconds
                 self.observeItem(item)
                 self.player.replaceCurrentItem(with: item)
+                self.lastBufferedEnd = 0
                 self.player.play()
 
-                // Darle margen a arrancar antes de juzgar.
-                try? await Task.sleep(for: .seconds(6))
+                // Esperar con paciencia: mientras entren datos seguimos
+                // esperando aunque tarde. Juzgar a los 6 s fijos hacía que con
+                // cobertura pobre nos rindiéramos justo cuando estaba a punto
+                // de arrancar, encadenando reconexiones inútiles.
+                let flowing = await self.awaitStreamStart()
                 if Task.isCancelled { return }
-
-                let flowing = self.player.timeControlStatus == .playing
-                    && !(self.player.currentItem?.isPlaybackBufferEmpty ?? true)
                 if flowing {
                     self.log.info("reconexión OK en el intento \(attempt, privacy: .public)")
                     self.state = .playing
@@ -303,6 +347,27 @@ final class IOSAudioPlayer {
                 try? await Task.sleep(for: .seconds(delay))
             }
         }
+    }
+
+    /// Espera a que el stream arranque de verdad. Devuelve `true` en cuanto
+    /// suena. Da margen extra mientras el buffer siga creciendo (señal lenta),
+    /// y se rinde solo si además deja de entrar nada.
+    private func awaitStreamStart() async -> Bool {
+        var quietTicks = 0
+        for _ in 0..<startupGraceSeconds {
+            try? await Task.sleep(for: .seconds(1))
+            if Task.isCancelled { return false }
+            if player.timeControlStatus == .playing { return true }
+            guard let item = player.currentItem else { continue }
+            if item.status == .failed { return false }
+            if bufferIsGrowing(item) {
+                quietTicks = 0          // sigue llegando audio: paciencia
+            } else {
+                quietTicks += 1
+                if quietTicks >= 10 { return false }   // 10 s sin nada: muerto
+            }
+        }
+        return player.timeControlStatus == .playing
     }
 
     private func cancelReconnect() {
