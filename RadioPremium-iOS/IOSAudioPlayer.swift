@@ -84,6 +84,7 @@ final class IOSAudioPlayer {
     private var rateObserver: NSKeyValueObservation?
     private var statusObserver: NSKeyValueObservation?
     private var bufferEmptyObserver: NSKeyValueObservation?
+    private var keepUpObserver: NSKeyValueObservation?
     private var failedObserver: NSObjectProtocol?
     private var stalledObserver: NSObjectProtocol?
     private let log = Logger(subsystem: "com.blancosampedro.RadioPremium-iOS", category: "audio")
@@ -166,10 +167,32 @@ final class IOSAudioPlayer {
     /// `true` mientras se está rellenando el colchón a velocidad reducida.
     private var isRefillingCushion = false
 
+    /// Últimas lecturas del colchón, para suavizar. `loadedTimeRanges` NO es
+    /// continuo: AVPlayer lo actualiza a trozos al completar cada segmento
+    /// descargado, así que la lectura cruda es una SIERRA (salta +10 s de
+    /// golpe, baja linealmente, vuelve a saltar). Medido: oscilaba 19↔30 s
+    /// cada 15 s con la red perfectamente estable. Sin suavizar, el regulador
+    /// perseguía cada diente y cambiaba de velocidad 14 veces en 4 minutos.
+    private var cushionHistory: [TimeInterval] = []
+    private let cushionHistorySize = 6   // 6 lecturas × 2 s = 12 s de ventana
+
+    /// Ticks consecutivos con el colchón por debajo del umbral. La velocidad
+    /// solo se toca cuando la situación PERSISTE, no ante un diente de sierra.
+    private var lowCushionTicks = 0
+    private let lowCushionTicksRequired = 4   // 8 s seguidos bajo
+
     init(initialVolume: Float = 0.8) {
         self.volume = max(0, min(1, initialVolume))
         player.volume = self.volume
-        player.automaticallyWaitsToMinimizeStalling = true
+        // FALSE a propósito. Con TRUE, AVPlayer ante cualquier micro-bajón del
+        // buffer PARA y no reanuda hasta estar "seguro" de que no volverá a
+        // parar — un criterio pensado para vídeo bajo demanda, donde puede
+        // descargar por adelantado. En radio EN DIRECTO ese "seguro" nunca
+        // llega del todo, así que cada bache de red de 2-3 s se convertía en
+        // una pausa de 5-15 s: justo el "corta breve, vuelve sola, cada pocos
+        // minutos" del coche. Con FALSE reanuda en cuanto hay audio que sonar,
+        // que es lo que queremos: el colchón de 26 s ya absorbe los baches.
+        player.automaticallyWaitsToMinimizeStalling = false
         configureAudioSession()
         observeRate()
         startNetworkMonitor()
@@ -261,6 +284,8 @@ final class IOSAudioPlayer {
         player.replaceCurrentItem(with: item)
         stalledSince = nil
         lastBufferedEnd = 0
+        cushionHistory.removeAll()
+        lowCushionTicks = 0
         if case .reconnecting = state {} else { state = .buffering }
         player.play()
     }
@@ -311,9 +336,10 @@ final class IOSAudioPlayer {
             return
         }
 
-        let cushion = bufferedAhead()
+        let cushion = smoothedCushion()
 
         if cushion >= healthyCushionSeconds {
+            lowCushionTicks = 0
             if isRefillingCushion {
                 restoreNormalRate()
                 log.info("colchón recuperado (\(String(format: "%.1f", cushion), privacy: .public)s) — velocidad normal")
@@ -321,12 +347,21 @@ final class IOSAudioPlayer {
             return
         }
 
-        guard cushion < targetCushionSeconds || isRefillingCushion else { return }
+        if cushion < targetCushionSeconds {
+            lowCushionTicks += 1
+        } else if !isRefillingCushion {
+            lowCushionTicks = 0
+            return
+        }
+
+        // Solo actuar si el colchón lleva un rato bajo (no un diente de sierra),
+        // o si ya estábamos rellenando (mantener hasta llegar a sano).
+        guard isRefillingCushion || lowCushionTicks >= lowCushionTicksRequired else { return }
 
         // Cuanto más bajo el colchón, más deprisa se rellena.
         let wanted = cushion < criticalCushionSeconds ? refillRateCritical : refillRateGentle
         if !isRefillingCushion {
-            log.info("colchón bajo (\(String(format: "%.1f", cushion), privacy: .public)s) — rellenando a \(wanted, privacy: .public)x")
+            log.info("colchón bajo (\(String(format: "%.1f", cushion), privacy: .public)s sostenido) — rellenando a \(wanted, privacy: .public)x")
             isRefillingCushion = true
         }
         if abs(player.rate - wanted) > 0.001 {
@@ -342,9 +377,19 @@ final class IOSAudioPlayer {
         }
     }
 
+    /// Colchón suavizado: media móvil de las últimas lecturas. Es lo que usa
+    /// el regulador; la lectura cruda solo se loguea.
+    private func smoothedCushion() -> TimeInterval {
+        let raw = bufferedAhead()
+        cushionHistory.append(raw)
+        if cushionHistory.count > cushionHistorySize { cushionHistory.removeFirst() }
+        return cushionHistory.reduce(0, +) / Double(cushionHistory.count)
+    }
+
     private func logBufferHealth() {
-        let ahead = bufferedAhead()
-        log.info("buffer: \(String(format: "%.1f", ahead), privacy: .public)s por delante")
+        let raw = bufferedAhead()
+        let avg = cushionHistory.isEmpty ? raw : cushionHistory.reduce(0, +) / Double(cushionHistory.count)
+        log.info("buffer: \(String(format: "%.1f", avg), privacy: .public)s (cruda \(String(format: "%.1f", raw), privacy: .public)s) rate=\(self.player.rate, privacy: .public)")
     }
 
     private func stopWatchdog() {
@@ -587,6 +632,7 @@ final class IOSAudioPlayer {
     private func observeItem(_ item: AVPlayerItem) {
         statusObserver?.invalidate()
         bufferEmptyObserver?.invalidate()
+        keepUpObserver?.invalidate()
         if let token = failedObserver { NotificationCenter.default.removeObserver(token) }
         if let token = stalledObserver { NotificationCenter.default.removeObserver(token) }
 
@@ -612,6 +658,21 @@ final class IOSAudioPlayer {
                 guard let self else { return }
                 if item.isPlaybackBufferEmpty && self.state == .playing {
                     self.state = .buffering
+                }
+            }
+        }
+
+        // Con waitsToMinimizeStalling=false, AVPlayer puede quedarse en rate 0
+        // tras vaciarse el buffer. En cuanto vuelva a haber algo que sonar
+        // (isPlaybackLikelyToKeepUp), empujamos la reanudación nosotros para
+        // no depender de su criterio conservador.
+        keepUpObserver = item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.shouldBePlaying else { return }
+                if case .reconnecting = self.state { return }
+                if item.isPlaybackLikelyToKeepUp, self.player.timeControlStatus != .playing {
+                    self.log.debug("buffer recuperado — reanudando sin esperar")
+                    self.player.play()
                 }
             }
         }
