@@ -124,6 +124,48 @@ final class IOSAudioPlayer {
     /// en las emisoras medidas); esto solo evita que iOS lo recorte.
     private let forwardBufferSeconds: TimeInterval = 30
 
+    // MARK: - Recuperación del colchón
+    //
+    // Una radio EN DIRECTO solo regala colchón al conectar (la ráfaga inicial:
+    // 7-18 s en las emisoras del usuario). A partir de ahí emite en tiempo
+    // real, así que cada bajón de cobertura consume reserva que NO se recupera
+    // sola: el servidor no tiene "audio del futuro" que darte para ponerte al
+    // día. Tras un rato de trayecto el colchón queda a cero y cualquier
+    // bajadita leve ya se oye como un corte.
+    //
+    // Solución: cuando la reserva está baja, reproducir un pelín más despacio.
+    // A 0,97x se gana ~1 s de colchón cada 33 s de música, y con corrección de
+    // tono es inaudible. El precio es ir unos segundos por detrás del directo,
+    // irrelevante en radio. Al recuperar el colchón se vuelve a 1,0x.
+
+    /// Colchón objetivo. Por debajo, se reproduce más lento para rellenar.
+    private let targetCushionSeconds: TimeInterval = 20
+
+    /// A partir de aquí se considera recuperado y se vuelve a velocidad normal.
+    /// La histéresis evita ir cambiando de velocidad continuamente.
+    ///
+    /// 26 s es MÁS de lo que da la ráfaga inicial del servidor (15-18 s): el
+    /// frenado permite acumular por encima de lo que regala el servidor, así
+    /// que el colchón en régimen estable acaba siendo mayor que el que tendría
+    /// una conexión recién abierta. Es margen extra ante cada bajada, y estar
+    /// 26 s por detrás del directo es irrelevante en radio.
+    private let healthyCushionSeconds: TimeInterval = 26
+
+    /// Colchón por debajo del cual la situación es crítica: cualquier bajón
+    /// se oiría ya. Aquí se rellena más deprisa.
+    private let criticalCushionSeconds: TimeInterval = 6
+
+    /// Velocidades de recuperación, escalonadas. Medido: a 0,97x se gana 1 s
+    /// de colchón cada 33 s — demasiado lento para volver de un bache serio
+    /// (7 minutos desde 5 s). A 0,94x se gana 1 s cada 17 s, que recupera en
+    /// ~3,5 minutos. Ambas son inaudibles con corrección de tono espectral;
+    /// la agresiva solo entra cuando de verdad hace falta.
+    private let refillRateCritical: Float = 0.94
+    private let refillRateGentle: Float = 0.97
+
+    /// `true` mientras se está rellenando el colchón a velocidad reducida.
+    private var isRefillingCushion = false
+
     init(initialVolume: Float = 0.8) {
         self.volume = max(0, min(1, initialVolume))
         player.volume = self.volume
@@ -151,6 +193,7 @@ final class IOSAudioPlayer {
     func pause() {
         log.info("pause (usuario)")
         shouldBePlaying = false
+        isRefillingCushion = false
         cancelReconnect()
         stopWatchdog()
         player.pause()
@@ -186,6 +229,7 @@ final class IOSAudioPlayer {
     func stop() {
         log.info("stop")
         shouldBePlaying = false
+        isRefillingCushion = false
         cancelReconnect()
         stopWatchdog()
         player.pause()
@@ -210,6 +254,9 @@ final class IOSAudioPlayer {
         let item = AVPlayerItem(url: station.url)
         // Conservar todo el colchón que el servidor dé (ver cabecera).
         item.preferredForwardBufferDuration = forwardBufferSeconds
+        // Corrección de tono: sin esto, reproducir a 0,97x bajaría el tono y
+        // se notaría. Con .spectral el cambio de velocidad es inaudible.
+        item.audioTimePitchAlgorithm = .spectral
         observeItem(item)
         player.replaceCurrentItem(with: item)
         stalledSince = nil
@@ -226,12 +273,78 @@ final class IOSAudioPlayer {
     private func startWatchdog() {
         stopWatchdog()
         watchdogTask = Task { @MainActor [weak self] in
+            var tick = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard let self, !Task.isCancelled, self.shouldBePlaying else { return }
                 self.checkForStall()
+                self.adjustRateForCushion()
+                tick += 1
+                // Salud del colchón cada 10 s. Sirve para diagnosticar desde
+                // el coche por qué se oye un corte: si aquí se ve el buffer
+                // cayendo a cero, el problema es reserva agotada, no red rota.
+                if tick % 5 == 0 { self.logBufferHealth() }
             }
         }
+    }
+
+    /// Segundos de audio ya descargados por delante de donde suena.
+    private func bufferedAhead() -> TimeInterval {
+        guard let item = player.currentItem else { return 0 }
+        let now = CMTimeGetSeconds(item.currentTime())
+        let end = item.loadedTimeRanges
+            .map { CMTimeGetSeconds($0.timeRangeValue.end) }
+            .filter { $0.isFinite }
+            .max() ?? 0
+        guard now.isFinite else { return 0 }
+        return max(0, end - now)
+    }
+
+    /// Ajusta la velocidad para reconstruir el colchón cuando está bajo.
+    ///
+    /// Solo actúa mientras suena de verdad: si está atascado o reconectando,
+    /// tocar la velocidad no ayudaría y enturbiaría el diagnóstico.
+    private func adjustRateForCushion() {
+        guard shouldBePlaying, player.timeControlStatus == .playing else {
+            // Al salir de reproducción normal, no dejar el player frenado.
+            if isRefillingCushion { restoreNormalRate() }
+            return
+        }
+
+        let cushion = bufferedAhead()
+
+        if cushion >= healthyCushionSeconds {
+            if isRefillingCushion {
+                restoreNormalRate()
+                log.info("colchón recuperado (\(String(format: "%.1f", cushion), privacy: .public)s) — velocidad normal")
+            }
+            return
+        }
+
+        guard cushion < targetCushionSeconds || isRefillingCushion else { return }
+
+        // Cuanto más bajo el colchón, más deprisa se rellena.
+        let wanted = cushion < criticalCushionSeconds ? refillRateCritical : refillRateGentle
+        if !isRefillingCushion {
+            log.info("colchón bajo (\(String(format: "%.1f", cushion), privacy: .public)s) — rellenando a \(wanted, privacy: .public)x")
+            isRefillingCushion = true
+        }
+        if abs(player.rate - wanted) > 0.001 {
+            log.info("colchón \(String(format: "%.1f", cushion), privacy: .public)s → velocidad \(wanted, privacy: .public)x")
+            player.rate = wanted
+        }
+    }
+
+    private func restoreNormalRate() {
+        isRefillingCushion = false
+        if player.timeControlStatus != .paused || shouldBePlaying {
+            player.rate = 1.0
+        }
+    }
+
+    private func logBufferHealth() {
+        let ahead = bufferedAhead()
+        log.info("buffer: \(String(format: "%.1f", ahead), privacy: .public)s por delante")
     }
 
     private func stopWatchdog() {
@@ -454,6 +567,8 @@ final class IOSAudioPlayer {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let rate = change.newValue ?? 0
+                // 0,97x es reproducción normal para nosotros (relleno de
+                // colchón), no una pausa: cualquier rate > 0 es "sonando".
                 if rate > 0 {
                     if self.state == .buffering || self.state == .idle {
                         self.state = .playing
