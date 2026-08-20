@@ -18,6 +18,10 @@ struct Station: Codable, Identifiable, Hashable, Sendable {
     let tags: String?               // CSV "pop,rock,..."
     let bitrate: Int?
     let codec: String?
+    /// `true` si Radio Browser marca el stream como HLS. Con HLS el servidor
+    /// conserva los últimos minutos en trocitos descargables: colchón REAL de
+    /// decenas de segundos, como TuneIn. nil en datos guardados antiguos.
+    let hls: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id = "stationuuid"
@@ -29,6 +33,13 @@ struct Station: Codable, Identifiable, Hashable, Sendable {
         case tags
         case bitrate
         case codec
+        case hls
+    }
+
+    /// `true` si el stream es HLS (por flag del directorio o por la URL).
+    var isHLS: Bool {
+        if hls == true { return true }
+        return url.absoluteString.lowercased().contains(".m3u8")
     }
 
     /// Decoder defensivo: Radio Browser a veces devuelve strings vacíos donde
@@ -52,6 +63,13 @@ struct Station: Codable, Identifiable, Hashable, Sendable {
         tags = try? c.decode(String.self, forKey: .tags)
         bitrate = try? c.decode(Int.self, forKey: .bitrate)
         codec = try? c.decode(String.self, forKey: .codec)
+        // Radio Browser manda 0/1; nuestros payloads guardados, Bool; los
+        // antiguos, nada. Tolerante con los tres.
+        if let intFlag = try? c.decode(Int.self, forKey: .hls) {
+            hls = intFlag == 1
+        } else {
+            hls = try? c.decode(Bool.self, forKey: .hls)
+        }
     }
 
     private static func lenientURL(_ s: String?) -> URL? {

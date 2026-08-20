@@ -104,6 +104,12 @@ final class IOSAudioPlayer {
     /// llegando datos aunque no suene — señal floja, pero stream vivo.
     private var lastBufferedEnd: TimeInterval = 0
 
+    /// Posición del cabezal en la última comprobación. Si avanza, está
+    /// SONANDO de verdad. Con waits=false, timeControlStatus dice "playing"
+    /// aunque no salga audio (verificado contra un stream muerto): el cabezal
+    /// es la única señal fiable de que se está reproduciendo.
+    private var lastPlayheadSeconds: TimeInterval = -1
+
     // Red
     private let pathMonitor = NWPathMonitor()
     private var isNetworkUp = true
@@ -209,7 +215,7 @@ final class IOSAudioPlayer {
 
     func play(_ station: Station) {
         log.info("play station=\(station.name, privacy: .public) url=\(station.url.absoluteString, privacy: .public)")
-        PlayerDiagnostics.shared.line("play", networkUp: isNetworkUp, extra: station.name)
+        PlayerDiagnostics.shared.line("play", networkUp: isNetworkUp, extra: station.isHLS ? "\(station.name)|HLS" : station.name)
         shouldBePlaying = true
         currentStation = station
         cancelReconnect()
@@ -277,18 +283,37 @@ final class IOSAudioPlayer {
 
     // MARK: - Arranque del item
 
-    private func startItem(for station: Station) {
-        activateAudioSession()
+    /// Fábrica única del AVPlayerItem — usada por play() Y por la reconexión.
+    /// (Antes la reconexión creaba el suyo a mano y se le olvidó la corrección
+    /// de tono: tras reconectar, el relleno de colchón cambiaba el pitch.)
+    private func makeItem(for station: Station) -> AVPlayerItem {
         let item = AVPlayerItem(url: station.url)
         // Conservar todo el colchón que el servidor dé (ver cabecera).
         item.preferredForwardBufferDuration = forwardBufferSeconds
         // Corrección de tono: sin esto, reproducir a 0,97x bajaría el tono y
         // se notaría. Con .spectral el cambio de velocidad es inaudible.
         item.audioTimePitchAlgorithm = .spectral
+
+        if station.isHLS {
+            // HLS con ventana DVR: el servidor conserva los últimos minutos.
+            // Arrancar 45 s por detrás del directo = 45 s de colchón REAL
+            // desde el primer segundo (AVPlayer lo recorta si la ventana es
+            // menor). Y preservar ese retraso tras cada atasco, en vez de
+            // volver al borde del directo pelado.
+            item.automaticallyPreservesTimeOffsetFromLive = true
+            item.configuredTimeOffsetFromLive = CMTime(seconds: 45, preferredTimescale: 1)
+        }
+        return item
+    }
+
+    private func startItem(for station: Station) {
+        activateAudioSession()
+        let item = makeItem(for: station)
         observeItem(item)
         player.replaceCurrentItem(with: item)
         stalledSince = nil
         lastBufferedEnd = 0
+        lastPlayheadSeconds = -1
         cushionHistory.removeAll()
         lowCushionTicks = 0
         if case .reconnecting = state {} else { state = .buffering }
@@ -322,11 +347,23 @@ final class IOSAudioPlayer {
     private func bufferedAhead() -> TimeInterval {
         guard let item = player.currentItem else { return 0 }
         let now = CMTimeGetSeconds(item.currentTime())
+        guard now.isFinite else { return 0 }
+
+        // En HLS, loadedTimeRanges no refleja el buffer (medido: 0,0 sonando
+        // perfectamente). Ahí el colchón real es la distancia al borde del
+        // directo: todo ese tramo está en el servidor listo para descargar.
+        if currentStation?.isHLS == true {
+            let seekEnd = item.seekableTimeRanges
+                .map { CMTimeGetSeconds($0.timeRangeValue.end) }
+                .filter { $0.isFinite }
+                .max() ?? 0
+            return max(0, seekEnd - now)
+        }
+
         let end = item.loadedTimeRanges
             .map { CMTimeGetSeconds($0.timeRangeValue.end) }
             .filter { $0.isFinite }
             .max() ?? 0
-        guard now.isFinite else { return 0 }
         return max(0, end - now)
     }
 
@@ -337,6 +374,14 @@ final class IOSAudioPlayer {
     private func adjustRateForCushion() {
         guard shouldBePlaying, player.timeControlStatus == .playing else {
             // Al salir de reproducción normal, no dejar el player frenado.
+            if isRefillingCushion { restoreNormalRate() }
+            return
+        }
+
+        // En HLS el buffering lo gestiona AVPlayer y nuestro frenado no pinta
+        // nada (además la métrica engañaba al regulador: lo dejaba a 0,94x
+        // para siempre). Velocidad normal y fuera.
+        if currentStation?.isHLS == true {
             if isRefillingCushion { restoreNormalRate() }
             return
         }
@@ -424,8 +469,14 @@ final class IOSAudioPlayer {
         if case .reconnecting = state { return }  // ya se está reintentando
         guard let item = player.currentItem else { return }
 
-        // 1. Suena de verdad → sano.
-        if player.timeControlStatus == .playing {
+        // 1. ¿Avanza el cabezal? Entonces suena de verdad → sano.
+        //    (timeControlStatus NO vale: con waits=false dice "playing"
+        //    aunque el buffer esté seco y no salga nada.)
+        let playhead = CMTimeGetSeconds(item.currentTime())
+        let audioFlowing = playhead.isFinite && lastPlayheadSeconds >= 0
+            && playhead > lastPlayheadSeconds + 0.5
+        if playhead.isFinite { lastPlayheadSeconds = playhead }
+        if audioFlowing {
             noteProgress()
             return
         }
@@ -502,11 +553,11 @@ final class IOSAudioPlayer {
                 if Task.isCancelled { return }
 
                 self.activateAudioSession()
-                let item = AVPlayerItem(url: station.url)
-                item.preferredForwardBufferDuration = self.forwardBufferSeconds
+                let item = self.makeItem(for: station)
                 self.observeItem(item)
                 self.player.replaceCurrentItem(with: item)
                 self.lastBufferedEnd = 0
+                self.lastPlayheadSeconds = -1
                 self.player.play()
 
                 // Esperar con paciencia: mientras entren datos seguimos
@@ -536,12 +587,21 @@ final class IOSAudioPlayer {
     /// y se rinde solo si además deja de entrar nada.
     private func awaitStreamStart() async -> Bool {
         var quietTicks = 0
+        var startPlayhead: TimeInterval = -1
         for _ in 0..<startupGraceSeconds {
             try? await Task.sleep(for: .seconds(1))
             if Task.isCancelled { return false }
-            if player.timeControlStatus == .playing { return true }
             guard let item = player.currentItem else { continue }
             if item.status == .failed { return false }
+
+            // Éxito = el CABEZAL avanza (audio real). timeControlStatus mentía:
+            // con waits=false daba "reconexión OK" contra un stream muerto.
+            let playhead = CMTimeGetSeconds(item.currentTime())
+            if playhead.isFinite {
+                if startPlayhead < 0 { startPlayhead = playhead }
+                if playhead > startPlayhead + 1.5 { return true }
+            }
+
             if bufferIsGrowing(item) {
                 quietTicks = 0          // sigue llegando audio: paciencia
             } else {
@@ -549,7 +609,7 @@ final class IOSAudioPlayer {
                 if quietTicks >= 10 { return false }   // 10 s sin nada: muerto
             }
         }
-        return player.timeControlStatus == .playing
+        return false
     }
 
     private func cancelReconnect() {
