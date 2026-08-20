@@ -121,9 +121,11 @@ final class IOSAudioPlayer {
     /// antes solo provoca reconexiones en cadena que arrancan igual de mal.
     private let startupGraceSeconds = 25
 
-    /// Colchón que pedimos conservar. El servidor manda lo que quiera (7-18 s
-    /// en las emisoras medidas); esto solo evita que iOS lo recorte.
-    private let forwardBufferSeconds: TimeInterval = 30
+    /// Tope de buffer hacia delante. OJO: preferredForwardBufferDuration es un
+    /// LÍMITE — con 30 estábamos tirando la parte sobrante de las ráfagas de
+    /// servidores generosos (streamtheworld y otros mandan 30-40 s de golpe).
+    /// 120 s ≈ 2 MB de memoria: gratis, y todo colchón extra es un corte menos.
+    private let forwardBufferSeconds: TimeInterval = 120
 
     // MARK: - Recuperación del colchón
     //
@@ -196,6 +198,7 @@ final class IOSAudioPlayer {
         configureAudioSession()
         observeRate()
         startNetworkMonitor()
+        observeAudioSessionInterruptions()
     }
 
     deinit {
@@ -206,6 +209,7 @@ final class IOSAudioPlayer {
 
     func play(_ station: Station) {
         log.info("play station=\(station.name, privacy: .public) url=\(station.url.absoluteString, privacy: .public)")
+        PlayerDiagnostics.shared.line("play", networkUp: isNetworkUp, extra: station.name)
         shouldBePlaying = true
         currentStation = station
         cancelReconnect()
@@ -215,6 +219,7 @@ final class IOSAudioPlayer {
 
     func pause() {
         log.info("pause (usuario)")
+        PlayerDiagnostics.shared.line("pause-usuario", cushionRaw: bufferedAhead())
         shouldBePlaying = false
         isRefillingCushion = false
         cancelReconnect()
@@ -343,6 +348,7 @@ final class IOSAudioPlayer {
             if isRefillingCushion {
                 restoreNormalRate()
                 log.info("colchón recuperado (\(String(format: "%.1f", cushion), privacy: .public)s) — velocidad normal")
+                PlayerDiagnostics.shared.line("relleno-off", cushionAvg: cushion)
             }
             return
         }
@@ -362,6 +368,7 @@ final class IOSAudioPlayer {
         let wanted = cushion < criticalCushionSeconds ? refillRateCritical : refillRateGentle
         if !isRefillingCushion {
             log.info("colchón bajo (\(String(format: "%.1f", cushion), privacy: .public)s sostenido) — rellenando a \(wanted, privacy: .public)x")
+            PlayerDiagnostics.shared.line("relleno-on", cushionAvg: cushion, rate: wanted)
             isRefillingCushion = true
         }
         if abs(player.rate - wanted) > 0.001 {
@@ -390,6 +397,20 @@ final class IOSAudioPlayer {
         let raw = bufferedAhead()
         let avg = cushionHistory.isEmpty ? raw : cushionHistory.reduce(0, +) / Double(cushionHistory.count)
         log.info("buffer: \(String(format: "%.1f", avg), privacy: .public)s (cruda \(String(format: "%.1f", raw), privacy: .public)s) rate=\(self.player.rate, privacy: .public)")
+        PlayerDiagnostics.shared.line(
+            "tick",
+            cushionRaw: raw, cushionAvg: avg, rate: player.rate,
+            playerStatus: describeTimeControl(), networkUp: isNetworkUp
+        )
+    }
+
+    private func describeTimeControl() -> String {
+        switch player.timeControlStatus {
+        case .playing: return "playing"
+        case .paused: return "paused"
+        case .waitingToPlayAtSpecifiedRate: return "waiting"
+        @unknown default: return "?"
+        }
     }
 
     private func stopWatchdog() {
@@ -431,6 +452,7 @@ final class IOSAudioPlayer {
         let dead = Date().timeIntervalSince(since)
         if dead >= stallToleranceSeconds {
             log.error("watchdog: \(Int(dead), privacy: .public)s sin datos ni audio — stream muerto, reconectando")
+            PlayerDiagnostics.shared.line("stream-muerto", cushionRaw: bufferedAhead(), networkUp: isNetworkUp, extra: "\(Int(dead))s sin datos")
             beginReconnect()
         }
     }
@@ -473,6 +495,7 @@ final class IOSAudioPlayer {
                 attempt += 1
                 self.state = .reconnecting(attempt: attempt)
                 self.log.info("reconectando intento \(attempt, privacy: .public)")
+                PlayerDiagnostics.shared.line("reconectando", networkUp: self.isNetworkUp, extra: "intento \(attempt)")
 
                 // Esperar a tener red: dentro del túnel no tiene sentido probar.
                 await self.waitForNetwork()
@@ -494,6 +517,7 @@ final class IOSAudioPlayer {
                 if Task.isCancelled { return }
                 if flowing {
                     self.log.info("reconexión OK en el intento \(attempt, privacy: .public)")
+                    PlayerDiagnostics.shared.line("reconexion-ok", cushionRaw: self.bufferedAhead(), extra: "intento \(attempt)")
                     self.state = .playing
                     self.stalledSince = nil
                     self.reconnectTask = nil
@@ -549,6 +573,7 @@ final class IOSAudioPlayer {
                     waiters.forEach { $0.resume() }
                     if wasDown {
                         self.log.info("red recuperada")
+                        PlayerDiagnostics.shared.line("red-recuperada")
                         // Volvimos de un túnel y debíamos estar sonando:
                         // reintentar ya, sin esperar al watchdog.
                         if self.shouldBePlaying, self.reconnectTask == nil {
@@ -557,6 +582,7 @@ final class IOSAudioPlayer {
                     }
                 } else {
                     self.log.info("red perdida")
+                    PlayerDiagnostics.shared.line("red-perdida", cushionRaw: self.bufferedAhead())
                 }
             }
         }
@@ -601,6 +627,66 @@ final class IOSAudioPlayer {
         } catch {
             // Frecuente e inofensivo si AVPlayer aún drena I/O; solo log.
             log.debug("AVAudioSession deactivate: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    // MARK: - Interrupciones de audio (llamadas, Siri, avisos del navegador)
+
+    /// En el coche las interrupciones son constantes: una indicación de Maps,
+    /// una llamada, Siri… El sistema PAUSA el player y, al terminar, es la app
+    /// quien debe reanudar. No había NINGÚN manejo de esto: tras cada
+    /// interrupción la radio se quedaba en silencio hasta tocar algo — cortes
+    /// que no tienen nada que ver con la cobertura y lo parecían.
+    private func observeAudioSessionInterruptions() {
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] note in
+            let info = note.userInfo
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let raw = info?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+                switch type {
+                case .began:
+                    self.log.info("interrupción de audio: comienza")
+                    PlayerDiagnostics.shared.line("interruption-began", networkUp: self.isNetworkUp)
+                case .ended:
+                    let opts = (info?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                        .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
+                    let shouldResume = opts.contains(.shouldResume)
+                    self.log.info("interrupción de audio: termina (shouldResume=\(shouldResume, privacy: .public))")
+                    PlayerDiagnostics.shared.line("interruption-ended", extra: shouldResume ? "shouldResume" : "sin shouldResume")
+                    // Si el usuario quería radio, la devolvemos aunque el
+                    // sistema no marque shouldResume (p. ej. tras una llamada
+                    // rechazada): es una radio, no un audiolibro.
+                    if self.shouldBePlaying {
+                        self.activateAudioSession()
+                        self.player.play()
+                    }
+                @unknown default:
+                    break
+                }
+            }
+        }
+
+        // Si el demonio de audio del sistema se reinicia, todo el pipeline
+        // queda huérfano: hay que reconstruir el item desde cero.
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.log.error("media services reset — reconstruyendo pipeline")
+                PlayerDiagnostics.shared.line("media-services-reset")
+                self.configureAudioSession()
+                if self.shouldBePlaying, let station = self.currentStation {
+                    self.startItem(for: station)
+                }
+            }
         }
     }
 
@@ -672,7 +758,9 @@ final class IOSAudioPlayer {
                 if case .reconnecting = self.state { return }
                 if item.isPlaybackLikelyToKeepUp, self.player.timeControlStatus != .playing {
                     self.log.debug("buffer recuperado — reanudando sin esperar")
-                    self.player.play()
+                    PlayerDiagnostics.shared.line("keepup-resume", cushionRaw: self.bufferedAhead())
+                    // No usar play(): resetearía a 1,0x y pisaría el relleno.
+                    self.player.rate = self.isRefillingCushion ? self.refillRateGentle : 1.0
                 }
             }
         }
@@ -705,6 +793,7 @@ final class IOSAudioPlayer {
             Task { @MainActor [weak self] in
                 guard let self, self.shouldBePlaying else { return }
                 self.log.info("playbackStalled — el watchdog decidirá si hay que reconectar")
+                PlayerDiagnostics.shared.line("stall", cushionRaw: self.bufferedAhead(), networkUp: self.isNetworkUp)
                 if self.stalledSince == nil { self.stalledSince = Date() }
             }
         }
